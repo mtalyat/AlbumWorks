@@ -15,6 +15,11 @@ FORMATS = ["mp3", "wav", "mp4a"]
 TEMP_NAME = "temp"
 THUMBNAIL_NAME = "thumbnail"
 
+COLOR_ERROR = "\033[91m"
+COLOR_SUCCESS = "\033[92m"
+COLOR_INFO = "\033[90m"
+COLOR_RESET = "\033[0m"
+
 def find_closest_string_index(target, string_list):
     """
     Finds the index of the closest string in a list to the given target string.
@@ -109,7 +114,7 @@ def update_metadata(file_path, title, artist, album, track_number, year=None, ge
                 type = "jpeg"
 
             if type not in ["jpeg", "png"]:
-                print(f"Unsupported artwork image format: {type}. Supported formats are: jpg, jpeg, png.")
+                print(f"{COLOR_ERROR}Unsupported artwork image format: {type}. Supported formats are: jpg, jpeg, png.{COLOR_RESET}")
                 return
 
             # Load the ID3 tag and add the artwork
@@ -126,7 +131,7 @@ def update_metadata(file_path, title, artist, album, track_number, year=None, ge
                 # Save changes
             audio.save()
     except Exception as e:
-        print(f"Failed to update metadata for {file_path}. Error: {e}")
+        print(f"{COLOR_ERROR}Failed to update metadata for {file_path}. Error: {e}{COLOR_RESET}")
 
 def update_metadata_with_album(file_path, album):
     """
@@ -281,7 +286,7 @@ def convert_file(path, format):
             subprocess.run(command, check=True, stdout=devnull, stderr=devnull)
         os.remove(path)  # Optionally remove the original file after conversion
     except Exception as e:
-        print(f"Failed to convert {path} to {format}. Error: {e}")
+        print(f"{COLOR_ERROR}Failed to convert {path} to {format}. Error: {e}{COLOR_RESET}")
         return None
 
     return target_path
@@ -366,7 +371,8 @@ def fix_title(title, album = None):
     temp = re.sub(rf'\b{re.escape(album.name)}\b', '', title, flags=re.IGNORECASE).strip()
 
     # If the title is empty, use the album name
-    if len(temp) == 0:
+    empty_pattern = r'[^a-zA-Z0-9]+'
+    if re.fullmatch(empty_pattern, temp):
         title = album.name
     else:
         title = temp
@@ -411,7 +417,7 @@ def download_youtube_video(url, output_folder, format, name, album):
         # Get the audio stream
         audio_stream = yt.streams.filter(only_audio=True).first()
         if not audio_stream:
-            print(f"No audio stream available for video: {yt.title}")
+            print(f"{COLOR_ERROR}No audio stream available for video: {yt.title}{COLOR_RESET}")
             return
 
         # Download the audio to the output folder
@@ -427,7 +433,7 @@ def download_youtube_video(url, output_folder, format, name, album):
         if not segments:
             final_file = convert_file(downloaded_file, format)
             update_metadata_with_album(final_file, album)
-            return
+            return final_file
 
         # Convert the downloaded file to WAV format using ffmpeg so it can be edited
         wav_file = convert_file(downloaded_file, "wav")
@@ -444,7 +450,7 @@ def download_youtube_video(url, output_folder, format, name, album):
 
         return video_output_folder
     except Exception as e:
-        print(f"An error occurred while processing video: {url}. Error: {e}")
+        print(f"{COLOR_ERROR}An error occurred while processing video: {url}. Error: {e}{COLOR_RESET}")
         return None
 
 def download_youtube_playlist(playlist_url, output_folder, format, name, album):
@@ -466,11 +472,11 @@ def download_youtube_playlist(playlist_url, output_folder, format, name, album):
         for video_url in playlist.video_urls:
             download_youtube_video(video_url, playlist_folder, format, None, album)
 
-        print(f"Playlist downloaded successfully: {playlist.title}")
+        print(f"{COLOR_SUCCESS}Playlist downloaded successfully: {playlist.title}{COLOR_RESET}")
 
         return playlist_folder
     except Exception as e:
-        print(f"An error occurred while processing the playlist: {playlist_url}. Error: {e}")
+        print(f"{COLOR_ERROR}An error occurred while processing the playlist: {playlist_url}. Error: {e}{COLOR_RESET}")
         return None
 
 def download_youtube_thumbnail(url, output_folder, name):
@@ -516,11 +522,11 @@ def download_youtube_thumbnail(url, output_folder, name):
                     file.write(chunk)
             return thumbnail_path
         else:
-            print(f"Failed to download thumbnail. HTTP Status Code: {response.status_code}")
+            print(f"{COLOR_ERROR}Failed to download thumbnail. HTTP Status Code: {response.status_code}{COLOR_RESET}")
             return None
 
     except Exception as e:
-        print(f"An error occurred while downloading the thumbnail: {e}")
+        print(f"{COLOR_ERROR}An error occurred while downloading the thumbnail: {e}{COLOR_RESET}")
         return None
 
 def open_directory(path):
@@ -534,7 +540,7 @@ def open_directory(path):
     if os.path.exists(path):
         os.startfile(path)  # Opens the directory in Windows Explorer
     else:
-        print(f"The directory does not exist: {path}")
+        print(f"{COLOR_ERROR}The directory does not exist: {path}{COLOR_RESET}")
 
 def main():
     os.system("cls")
@@ -545,18 +551,18 @@ def main():
     # Prompt for album information
     album_name = input("Enter the album name: ").strip()
     if len(album_name) == 0:
-        print("No album name given.")
+        print(f"{COLOR_ERROR}No album name given.{COLOR_RESET}")
         return
     album_artist = input("Enter the album artist: ").strip()
     if len(album_artist) == 0:
-        print("No album artist given.")
+        print(f"{COLOR_ERROR}No album artist given.{COLOR_RESET}")
         return
-    print("Retrieving album information...")
+    print(f"{COLOR_INFO}Retrieving album information...{COLOR_RESET}")
     album_info = get_album_info(album_name, album_artist)
     album_year = None
     album_tracks = None
     if "not found" in album_info or "error" in album_info or album_info["artist"] != album_artist:
-        print("Album not found.")
+        print(f"{COLOR_INFO}Album not found.{COLOR_RESET}")
         if "error" in album_info:
             print(album_info["error"])
         print("Please enter the rest of the album info manually.")
@@ -564,22 +570,22 @@ def main():
     else:
         album_year = album_info["release_date"][:4]
         album_tracks = album_info["tracks"]
-        print("Done.")
+        print(f"{COLOR_SUCCESS}Done.{COLOR_RESET}")
 
     # Prompt for output format
     formats_list = ", ".join(FORMATS)
     format = input(f"Enter the desired output format ({formats_list}): ").strip().lower()
     if len(format) == 0:
-        print(f"Defaulting to {FORMATS[0]}.")
+        print(f"{COLOR_INFO}Defaulting to {FORMATS[0]}.{COLOR_RESET}")
         format = FORMATS[0]
     if format not in FORMATS:
-        print(f"Invalid format. Supported formats are: {formats_list}")
+        print(f"{COLOR_ERROR}Invalid format. Supported formats are: {formats_list}{COLOR_RESET}")
         return
 
     # Prompt for YouTube URL
     url = input("Enter the YouTube video or playlist URL: ").strip()
     if len(url) == 0:
-        print("No URL given.")
+        print(f"{COLOR_ERROR}No URL given.{COLOR_RESET}")
         return
     
     # Prompt for artwork, if user wants to override
@@ -588,11 +594,11 @@ def main():
     if not album_artwork_temporary:
         # Use existing file
         if not os.path.exists(album_artwork):
-            print("Artwork path does not exist.")
+            print(f"{COLOR_ERROR}Artwork path does not exist.{COLOR_RESET}")
             return
     else:
         # Download the thumbnail
-        print("Downloading thumbnail...")
+        print(f"{COLOR_INFO}Downloading thumbnail...{COLOR_RESET}")
 
         # Create the output path for the thumbnail
         os.makedirs(OUTPUT_PATH, exist_ok=True)
@@ -607,7 +613,7 @@ def main():
     if len(output_folder) == 0:
         output_folder = OUTPUT_PATH
     if not os.path.exists(output_folder):
-        print("Output folder does not exist.")
+        print(f"{COLOR_ERROR}Output folder does not exist.{COLOR_RESET}")
         return
 
     print("")
@@ -619,7 +625,7 @@ def main():
         # Process as a single video
         output_folder = download_youtube_video(url, OUTPUT_PATH, format, album.get_folder_name(), album)
     else:
-        print("Invalid URL. Please provide a valid YouTube video or playlist URL.")
+        print(f"{COLOR_ERROR}Invalid URL. Please provide a valid YouTube video or playlist URL.{COLOR_RESET}")
         return
     
     # Delete thumbnail if it was downloaded
@@ -627,7 +633,7 @@ def main():
         try:
             os.remove(album_artwork)
         except Exception as e:
-            print(f"Failed to delete thumbnail: {e}")
+            print(f"{COLOR_ERROR}Failed to delete thumbnail: {e}{COLOR_RESET}")
     
     # Done
     print("")
