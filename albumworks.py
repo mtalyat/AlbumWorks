@@ -12,6 +12,8 @@ from mutagen.id3 import ID3, APIC
 FFMPEG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "ffmpeg", "bin", "ffmpeg.exe")
 OUTPUT_PATH = os.path.join(os.path.expanduser("~"), "Documents")
 FORMATS = ["mp3", "wav", "mp4a"]
+TEMP_NAME = "temp"
+THUMBNAIL_NAME = "thumbnail"
 
 def find_closest_string_index(target, string_list):
     """
@@ -36,7 +38,6 @@ class Album:
         self.artist = artist
         self.year = year
         self.artwork = artwork
-        self.generate_track_list = tracks is None
         self.tracks = tracks if tracks else []
         self.lowered_tracks = [track.lower() for track in tracks] if tracks else []
 
@@ -50,21 +51,24 @@ class Album:
         Returns:
             int: The index of the track, or -1 if not found.
         """
-        # If creating the list on the fly...
-        if self.generate_track_list:
-            # Check if already exists exactly
-            lowered_name = name.lower()
-            if lowered_name in self.lowered_tracks:
-                # Existing
-                return self.lowered_tracks.index(lowered_name)
-            # Add New
-            index = len(self.tracks)
-            self.tracks.append(name)
-            self.lowered_tracks.append(name.lower())
+        index = find_closest_string_index(name.lower(), self.lowered_tracks)
+        if index != -1:
+            # Existing track found
             return index
-        
-        # If using list from online...
-        return find_closest_string_index(name.lower(), self.lowered_tracks)
+        # Add new track
+        index = len(self.tracks)
+        self.tracks.append(name)
+        self.lowered_tracks.append(name.lower())
+        return index
+    
+    def get_folder_name(self):
+        """
+        Returns a sanitized folder name for the album.
+
+        Returns:
+            str: The sanitized folder name.
+        """
+        return fix_path(f"{self.artist} - {self.name}")
     
 def update_metadata(file_path, title, artist, album, track_number, year=None, genre=None, artwork=None):
     """
@@ -133,10 +137,13 @@ def update_metadata_with_album(file_path, album):
         album (Album): Album object containing metadata.
     """
     # Get title from the file name
-    title = os.path.splitext(os.path.basename(file_path))[0]
+    file_name = os.path.splitext(os.path.basename(file_path))[0]
 
     # Get the track index
-    track_index = album.get_track_index(title)
+    track_index = album.get_track_index(file_name)
+
+    # Now get the actual track title
+    title = album.tracks[track_index]
 
     update_metadata(file_path, title, album.artist, album.name, track_index + 1, album.year, None, album.artwork)
 
@@ -318,6 +325,12 @@ def get_album_info(album_name, artist_name):
     except Exception as e:
         return {"error": f"An error occurred: {e}"}
 
+
+def fix_path(path):
+    # Remove illegal characters for file and folder names
+    path = re.sub(r'[<>:"/\\|?*]', '', path)
+    return path.strip()
+
 def fix_title(title, album = None):
     """
     Cleans up the YouTube title by removing unwanted text and illegal characters.
@@ -332,7 +345,7 @@ def fix_title(title, album = None):
     title = re.sub(r'\(.*?official.*?audio.*?\)', '', title, flags=re.IGNORECASE)
 
     # Remove "Full Soundtrack" or similar variants
-    title = re.sub(r'\b(full|complete|original)\s+(soundtrack|album)\b', '', title, flags=re.IGNORECASE)
+    title = re.sub(r'\b\(?(full|complete|original)\s+(soundtrack|album)\)?\b', '', title, flags=re.IGNORECASE)
 
     # Remove "OST"
     title = re.sub(r'\bOST\b', '', title, flags=re.IGNORECASE)
@@ -344,12 +357,9 @@ def fix_title(title, album = None):
     # Remove " - "or " | ", etc.
     title = re.sub(r' ?[-|] ?', '', title)
 
-    # Remove illegal characters for file and folder names
-    title = re.sub(r'[<>:"/\\|?*]', '_', title)
-
     # If no album, done here
     if not album:
-        return title.strip()
+        return fix_path(title)
 
     # Remove any mention of the album name
     title = title.strip()
@@ -366,7 +376,7 @@ def fix_title(title, album = None):
     if track_index != -1:
         title = album.tracks[track_index]
 
-    return title
+    return fix_path(title)
 
 def download_youtube_video(url, output_folder, format, name, album):
     """
@@ -385,39 +395,39 @@ def download_youtube_video(url, output_folder, format, name, album):
         segments = parse_timestamps(description)
 
         # Get video title and description
-        title = fix_title(yt.title, album)
-        if not name:
-            name = title
+        title = yt.title
 
         # Print index and title, if no segments found
         if not segments:
+            title = fix_title(yt.title, album)
             track_index = album.get_track_index(title)
             print(f"\t{track_index + 1}) {title}")
+        else:
+            title = fix_title(yt.title, None)
+        
+        if not name:
+            name = title
 
         # Get the audio stream
         audio_stream = yt.streams.filter(only_audio=True).first()
         if not audio_stream:
-            print(f"No audio stream available for video: {title}")
+            print(f"No audio stream available for video: {yt.title}")
             return
 
         # Download the audio to the output folder
         downloaded_file = audio_stream.download(output_path=output_folder)
 
         # Rename to use the safe title
-        safe_file_name = os.path.join(output_folder, f"{title}.mp4")
-        os.rename(downloaded_file, safe_file_name)
-        downloaded_file = safe_file_name
+        file_name = TEMP_NAME if segments else title
+        file_name = os.path.join(output_folder, f"{file_name}.mp4")
+        os.rename(downloaded_file, file_name)
+        downloaded_file = file_name
 
         # if no segments are found, convert to target format and return
         if not segments:
             final_file = convert_file(downloaded_file, format)
             update_metadata_with_album(final_file, album)
             return
-        
-        # Remove track from album, if needed
-        if album.generate_track_list:
-            album.tracks = album.tracks[:-1]
-            album.lowered_tracks = album.lowered_tracks[:-1]
 
         # Convert the downloaded file to WAV format using ffmpeg so it can be edited
         wav_file = convert_file(downloaded_file, "wav")
@@ -428,6 +438,10 @@ def download_youtube_video(url, output_folder, format, name, album):
 
         # Split the audio into segments
         split_audio(wav_file, segments, video_output_folder, format, album)
+
+        # Delete the temporary WAV file
+        os.remove(wav_file)
+
         return video_output_folder
     except Exception as e:
         print(f"An error occurred while processing video: {url}. Error: {e}")
@@ -447,8 +461,6 @@ def download_youtube_playlist(playlist_url, output_folder, format, name, album):
         # Sanitize the playlist title
         playlist_folder = os.path.join(output_folder, name)
         os.makedirs(playlist_folder, exist_ok=True)
-
-        print(f"\t\t{playlist.title}:")
 
         # Iterate through all videos in the playlist
         for video_url in playlist.video_urls:
@@ -525,6 +537,7 @@ def open_directory(path):
         print(f"The directory does not exist: {path}")
 
 def main():
+    os.system("cls")
     print("Welcome to the AlbumWorks downloader!")
     print("You can download individual videos or entire playlists.")
     print("")
@@ -553,6 +566,16 @@ def main():
         album_tracks = album_info["tracks"]
         print("Done.")
 
+    # Prompt for output format
+    formats_list = ", ".join(FORMATS)
+    format = input(f"Enter the desired output format ({formats_list}): ").strip().lower()
+    if len(format) == 0:
+        print(f"Defaulting to {FORMATS[0]}.")
+        format = FORMATS[0]
+    if format not in FORMATS:
+        print(f"Invalid format. Supported formats are: {formats_list}")
+        return
+
     # Prompt for YouTube URL
     url = input("Enter the YouTube video or playlist URL: ").strip()
     if len(url) == 0:
@@ -572,31 +595,29 @@ def main():
         print("Downloading thumbnail...")
 
         # Create the output path for the thumbnail
-        output_path = os.path.join(OUTPUT_PATH, album_name)
-        os.makedirs(output_path, exist_ok=True)
+        os.makedirs(OUTPUT_PATH, exist_ok=True)
 
         # Download and use the thumbnail
-        album_artwork = download_youtube_thumbnail(url, output_path, "thumbnail")
+        album_artwork = download_youtube_thumbnail(url, OUTPUT_PATH, THUMBNAIL_NAME)
 
     album = Album(album_name, album_artist, album_year, album_tracks, album_artwork)
-    
-    # Prompt for output format
-    formats_list = ", ".join(FORMATS)
-    format = input(f"Enter the desired output format ({formats_list}): ").strip().lower()
-    if len(format) == 0:
-        print(f"Defaulting to {FORMATS[0]}.")
-        format = FORMATS[0]
-    if format not in FORMATS:
-        print(f"Invalid format. Supported formats are: {formats_list}")
+
+    # Prompt for output folder
+    output_folder = input(f"Enter the output folder (default: {OUTPUT_PATH}): ").strip()
+    if len(output_folder) == 0:
+        output_folder = OUTPUT_PATH
+    if not os.path.exists(output_folder):
+        print("Output folder does not exist.")
         return
 
-    output_folder = None
+    print("")
+    print(f"\t\t{album.name}:")
     if "playlist" in url:
         # Process as a playlist
-        output_folder = download_youtube_playlist(url, OUTPUT_PATH, format, album_name, album)
+        output_folder = download_youtube_playlist(url, OUTPUT_PATH, format, album.get_folder_name(), album)
     elif "watch" in url:
         # Process as a single video
-        output_folder = download_youtube_video(url, OUTPUT_PATH, format, album_name, album)
+        output_folder = download_youtube_video(url, OUTPUT_PATH, format, album.get_folder_name(), album)
     else:
         print("Invalid URL. Please provide a valid YouTube video or playlist URL.")
         return
