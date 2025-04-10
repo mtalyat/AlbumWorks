@@ -630,6 +630,7 @@ def main():
             print(f"Failed to delete thumbnail: {e}")
     
     # Done
+    print("")
     print("Download complete.")
     print(f"Files saved in: {output_folder}")
     
