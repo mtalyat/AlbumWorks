@@ -1,0 +1,5 @@
+pytube
+pytubefix
+requests
+musicbrainzngs
+mutagen
