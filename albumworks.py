@@ -162,15 +162,25 @@ def parse_timestamps(description):
     Returns:
         list: A list of tuples containing (start_time, segment_name).
     """
-    # Regular expression to match timestamps (e.g., 0:00, 12:34, 1:23:45)
-    pattern = r"(\d{1,2}:\d{2}(?::\d{2})?)\s+(.+)"
-    matches = re.findall(pattern, description)
+    # Regular expression to match timestamps in both formats:
+    # 1. "0:00 Segment Name"
+    # 2. "Segment Name 0:00"
+    time_pattern = r"\[?(\d+:\d{2}(?::\d{2})?)\]?"
+    before_pattern = fr"\d+\.?\)?\s+{time_pattern}\s+(.+)"
+    after_pattern = fr"\d+\.?\)?\s+(.+)\s+{time_pattern}"
+    before_matches = re.findall(before_pattern, description)
+    after_matches = re.findall(after_pattern, description)
+
+    matches = list()
+    for match in before_matches:
+        matches.append([match[0], match[1]])
+    for match in after_matches:
+        matches.append([match[1], match[0]])
 
     segments = []
-    for match in matches:
-        time_str, name = match
+    for time, name in matches:
         # Split the time string into components
-        time_parts = list(map(int, time_str.split(":")))
+        time_parts = list(map(int, time.split(":")))
         # Convert to total seconds (supports hours:minutes:seconds or minutes:seconds)
         total_seconds = sum(x * 60 ** i for i, x in enumerate(reversed(time_parts)))
         segments.append((total_seconds, name.strip()))
