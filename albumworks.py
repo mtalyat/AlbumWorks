@@ -10,7 +10,7 @@ from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3, APIC
 
 FFMPEG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "ffmpeg", "bin", "ffmpeg.exe")
-OUTPUT_PATH = os.path.join(os.path.expanduser("~"), "Documents")
+OUTPUT_PATH = os.path.join(os.path.expanduser("~"), "Music")
 FORMATS = ["mp3", "wav", "mp4a"]
 TEMP_NAME = "temp"
 THUMBNAIL_NAME = "thumbnail"
@@ -162,20 +162,21 @@ def parse_timestamps(description):
     Returns:
         list: A list of tuples containing (start_time, segment_name).
     """
+    lines = description.splitlines()
+    matches = list()
     # Regular expression to match timestamps in both formats:
     # 1. "0:00 Segment Name"
     # 2. "Segment Name 0:00"
-    time_pattern = r"\[?(\d+:\d{2}(?::\d{2})?)\]?"
-    before_pattern = fr"\d+\.?\)?\s+{time_pattern}\s+(.+)"
-    after_pattern = fr"\d+\.?\)?\s+(.+)\s+{time_pattern}"
-    before_matches = re.findall(before_pattern, description)
-    after_matches = re.findall(after_pattern, description)
-
-    matches = list()
-    for match in before_matches:
-        matches.append([match[0], match[1]])
-    for match in after_matches:
-        matches.append([match[1], match[0]])
+    TIME_PATTERN = r"\[?(\d+:\d{2}(?::\d{2})?)\]?"
+    NUMBER_PATTERN = r"(?:\d+\.?\)?)?\s*"
+    NAME_PATTERN = r"(.+)"
+    before_pattern = fr"^{NUMBER_PATTERN}{TIME_PATTERN}\s+{NAME_PATTERN}"
+    after_pattern = fr"^{NUMBER_PATTERN}{NAME_PATTERN}\s+{TIME_PATTERN}"
+    for line in lines:
+        for match in re.findall(before_pattern, line):
+            matches.append([match[0], match[1]])
+        for match in re.findall(after_pattern, line):
+            matches.append([match[1], match[0]])
 
     segments = []
     for time, name in matches:
@@ -340,7 +341,6 @@ def get_album_info(album_name, artist_name):
     except Exception as e:
         return {"error": f"An error occurred: {e}"}
 
-
 def fix_path(path):
     # Remove illegal characters for file and folder names
     path = re.sub(r'[<>:"/\\|?*]', '', path)
@@ -381,7 +381,7 @@ def fix_title(title, album = None):
     temp = re.sub(rf'\b{re.escape(album.name)}\b', '', title, flags=re.IGNORECASE).strip()
 
     # If the title is empty, use the album name
-    empty_pattern = r'[^a-zA-Z0-9]+'
+    empty_pattern = r'^[^a-zA-Z0-9]*$'
     if re.fullmatch(empty_pattern, temp):
         title = album.name
     else:
@@ -647,8 +647,7 @@ def main():
     
     # Done
     print("")
-    print("Download complete.")
-    print(f"Files saved in: {output_folder}")
+    print(f"Files saved to: {output_folder}")
     
     # Open output folder
     if output_folder:
