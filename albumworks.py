@@ -8,6 +8,7 @@ import wave
 from pytubefix import YouTube, Playlist
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3, APIC
+import sys
 
 FFMPEG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "ffmpeg", "bin", "ffmpeg.exe")
 OUTPUT_PATH = os.path.join(os.path.expanduser("~"), "Music")
@@ -37,11 +38,28 @@ def find_closest_string_index(target, string_list):
         return string_list.index(closest_match)
     return -1
 
+def set_title(artist = None, album = None, song = None):
+    """Sets the console title to the current album, artist, and song."""
+    if artist is None:
+        artist = ""
+    else:
+        artist = f' - {artist}'
+    if album is None:
+        album = ""
+    else:
+        album = f' - {album}'
+    if song is None:
+        song = ""
+    else:
+        song = f' - {song}'
+    os.system(f'title "AlbumWorks{artist}{album}{song}"')
+
 class Album:
-    def __init__(self, name, artist, year, tracks, artwork):
+    def __init__(self, name, artist, year, genre, tracks, artwork):
         self.name = name
         self.artist = artist
         self.year = year
+        self.genre = genre
         self.artwork = artwork
         self.tracks = tracks if tracks else []
         self.lowered_tracks = [track.lower() for track in tracks] if tracks else []
@@ -130,6 +148,8 @@ def update_metadata(file_path, title, artist, album, track_number, year=None, ge
 
                 # Save changes
             audio.save()
+        
+        # DEBUG: print values
     except Exception as e:
         print(f"{COLOR_ERROR}Failed to update metadata for {file_path}. Error: {e}{COLOR_RESET}")
 
@@ -150,7 +170,7 @@ def update_metadata_with_album(file_path, album):
     # Now get the actual track title
     title = album.tracks[track_index]
 
-    update_metadata(file_path, title, album.artist, album.name, track_index + 1, album.year, None, album.artwork)
+    update_metadata(file_path, title, album.artist, album.name, track_index + 1, album.year, album.genre, album.artwork)
 
 def parse_timestamps(description):
     """
@@ -244,6 +264,7 @@ def split_audio(file_path, segments, output_folder, format, album):
             used.add(track_index)
 
             print(f"\t{track_index + 1}) {title}")
+            set_title(album.artist, album.name, title)
             output_path = os.path.join(output_folder, f"{title}.wav")
             with wave.open(output_path, "wb") as segment:
                 segment.setparams(params)
@@ -356,14 +377,14 @@ def fix_title(title, album = None):
     Returns:
         str: The sanitized title.
     """
-    # Remove "(Official audio)" or similar variants
-    title = re.sub(r'\(.*?official.*?audio.*?\)', '', title, flags=re.IGNORECASE)
+    # Remove "(...)" text"
+    title = re.sub(r'(\(.*\))', '', title, flags=re.IGNORECASE)
 
-    # Remove "Full Soundtrack" or similar variants
-    title = re.sub(r'\b\(?(full|complete|original)\s+(soundtrack|album)\)?\b', '', title, flags=re.IGNORECASE)
+    # Remove any common words or phrases "OST"
+    title = re.sub(r'\b(OST|Lyrics)\b', '', title, flags=re.IGNORECASE)
 
-    # Remove "OST"
-    title = re.sub(r'\bOST\b', '', title, flags=re.IGNORECASE)
+    # Remove anything past '|'
+    title = re.sub(r'\|.*$', '', title, flags=re.IGNORECASE)
 
     # Remove any mention of the artist name
     if album:
@@ -372,12 +393,14 @@ def fix_title(title, album = None):
     # Remove " - "or " | ", etc.
     title = re.sub(r' ?[-|] ?', '', title)
 
+    # Remove leading or trailing whitespace and punctuation
+    title = re.sub(r'^[^a-zA-Z0-9\(]+|[^a-zA-Z0-9\)]+$', '', title)
+
     # If no album, done here
     if not album:
         return fix_path(title)
 
     # Remove any mention of the album name
-    title = title.strip()
     temp = re.sub(rf'\b{re.escape(album.name)}\b', '', title, flags=re.IGNORECASE).strip()
 
     # If the title is empty, use the album name
@@ -394,7 +417,7 @@ def fix_title(title, album = None):
 
     return fix_path(title)
 
-def download_youtube_video(url, output_folder, format, name, album):
+def download_youtube_video(url, output_folder, format, album):
     """
     Downloads a YouTube video, converts it to WAV, splits it into segments, and saves it in the specified folder.
 
@@ -418,11 +441,9 @@ def download_youtube_video(url, output_folder, format, name, album):
             title = fix_title(yt.title, album)
             track_index = album.get_track_index(title)
             print(f"\t{track_index + 1}) {title}")
+            set_title(album.artist, album.name, title)
         else:
-            title = fix_title(yt.title, None)
-        
-        if not name:
-            name = title
+            title = fix_title(yt.title, album)
 
         # Get the audio stream
         audio_stream = yt.streams.filter(only_audio=True).first()
@@ -449,21 +470,20 @@ def download_youtube_video(url, output_folder, format, name, album):
         wav_file = convert_file(downloaded_file, "wav")
 
         # Create a folder for the video's segments
-        video_output_folder = os.path.join(output_folder, name)
-        os.makedirs(video_output_folder, exist_ok=True)
+        os.makedirs(output_folder, exist_ok=True)
 
         # Split the audio into segments
-        split_audio(wav_file, segments, video_output_folder, format, album)
+        split_audio(wav_file, segments, output_folder, format, album)
 
         # Delete the temporary WAV file
         os.remove(wav_file)
 
-        return video_output_folder
+        return output_folder
     except Exception as e:
         print(f"{COLOR_ERROR}An error occurred while processing video: {url}. Error: {e}{COLOR_RESET}")
         return None
 
-def download_youtube_playlist(playlist_url, output_folder, format, name, album):
+def download_youtube_playlist(playlist_url, output_folder, format, album):
     """
     Downloads all videos in a YouTube playlist.
 
@@ -474,17 +494,16 @@ def download_youtube_playlist(playlist_url, output_folder, format, name, album):
         # Create a Playlist object
         playlist = Playlist(playlist_url)
 
-        # Sanitize the playlist title
-        playlist_folder = os.path.join(output_folder, name)
-        os.makedirs(playlist_folder, exist_ok=True)
+        # Create the output folder if it doesn't exist
+        os.makedirs(output_folder, exist_ok=True)
 
         # Iterate through all videos in the playlist
         for video_url in playlist.video_urls:
-            download_youtube_video(video_url, playlist_folder, format, None, album)
+            download_youtube_video(video_url, output_folder, format, album)
 
         print(f"{COLOR_SUCCESS}Playlist downloaded successfully: {playlist.title}{COLOR_RESET}")
 
-        return playlist_folder
+        return output_folder
     except Exception as e:
         print(f"{COLOR_ERROR}An error occurred while processing the playlist: {playlist_url}. Error: {e}{COLOR_RESET}")
         return None
@@ -539,6 +558,42 @@ def download_youtube_thumbnail(url, output_folder, name):
         print(f"{COLOR_ERROR}An error occurred while downloading the thumbnail: {e}{COLOR_RESET}")
         return None
 
+def download_image(url, output_folder, name):
+    """
+    Downloads an image from a URL and saves it to the specified folder.
+
+    Args:
+        url (str): The URL of the image to download.
+        output_folder (str): The folder where the image will be saved.
+        name (str): The name of the image file (without extension).
+
+    Returns:
+        str: Path to the downloaded image, or None if an error occurs.
+    """
+    try:
+        # Ensure the output folder exists
+        os.makedirs(output_folder, exist_ok=True)
+
+        # Define the output file path
+        image_path = os.path.join(output_folder, f"{name}.jpg")
+
+        # Download the image
+        response = requests.get(url, stream=True)
+        if response.status_code == 200:
+            with open(image_path, "wb") as file:
+                for chunk in response.iter_content(1024):
+                    file.write(chunk)
+            return image_path
+        else:
+            print(f"{COLOR_ERROR}Failed to download image. HTTP Status Code: {response.status_code}{COLOR_RESET}")
+            return None
+        
+        return image_path
+
+    except Exception as e:
+        print(f"{COLOR_ERROR}An error occurred while downloading the image: {e}{COLOR_RESET}")
+        return None
+
 def open_directory(path):
     """
     Opens the given directory in the system file explorer.
@@ -557,101 +612,115 @@ def main():
     print("Welcome to the AlbumWorks downloader!")
     print("You can download individual videos or entire playlists.")
     print("")
-
-    # Prompt for album information
-    album_name = input("Enter the album name: ").strip()
-    if len(album_name) == 0:
-        print(f"{COLOR_ERROR}No album name given.{COLOR_RESET}")
-        return
-    album_artist = input("Enter the album artist: ").strip()
-    if len(album_artist) == 0:
-        print(f"{COLOR_ERROR}No album artist given.{COLOR_RESET}")
-        return
-    print(f"{COLOR_INFO}Retrieving album information...{COLOR_RESET}")
-    album_info = get_album_info(album_name, album_artist)
-    album_year = None
-    album_tracks = None
-    if "not found" in album_info or "error" in album_info or album_info["artist"] != album_artist:
-        print(f"{COLOR_INFO}Album not found.{COLOR_RESET}")
-        if "error" in album_info:
-            print(album_info["error"])
-        print("Please enter the rest of the album info manually.")
-        album_year = input("Enter the album year: ").strip()
-    else:
-        album_year = album_info["release_date"][:4]
-        album_tracks = album_info["tracks"]
-        print(f"{COLOR_SUCCESS}Done.{COLOR_RESET}")
-
-    # Prompt for output format
-    formats_list = ", ".join(FORMATS)
-    format = input(f"Enter the desired output format ({formats_list}): ").strip().lower()
-    if len(format) == 0:
-        print(f"{COLOR_INFO}Defaulting to {FORMATS[0]}.{COLOR_RESET}")
-        format = FORMATS[0]
-    if format not in FORMATS:
-        print(f"{COLOR_ERROR}Invalid format. Supported formats are: {formats_list}{COLOR_RESET}")
-        return
-
-    # Prompt for YouTube URL
-    url = input("Enter the YouTube video or playlist URL: ").strip()
-    if len(url) == 0:
-        print(f"{COLOR_ERROR}No URL given.{COLOR_RESET}")
-        return
-    
-    # Prompt for artwork, if user wants to override
-    album_artwork = input("Enter the path to the album artwork (or leave blank to use the thumbnail): ").strip()
-    album_artwork_temporary = len(album_artwork) == 0
-    if not album_artwork_temporary:
-        # Use existing file
-        if not os.path.exists(album_artwork):
-            print(f"{COLOR_ERROR}Artwork path does not exist.{COLOR_RESET}")
+    while True:
+        set_title()
+        # Prompt for album information
+        album_artist = input("Enter the album artist: ").strip()
+        if len(album_artist) == 0:
+            print(f"{COLOR_ERROR}No album artist given.{COLOR_RESET}")
             return
-    else:
-        # Download the thumbnail
-        print(f"{COLOR_INFO}Downloading thumbnail...{COLOR_RESET}")
+        album_name = input("Enter the album name: ").strip()
+        if len(album_name) == 0:
+            print(f"{COLOR_ERROR}No album name given.{COLOR_RESET}")
+            return
+        print(f"{COLOR_INFO}Retrieving album information...{COLOR_RESET}")
+        album_info = get_album_info(album_name, album_artist)
+        album_year = None
+        album_tracks = None
+        if "not found" in album_info or "error" in album_info or album_info["artist"] != album_artist:
+            print(f"{COLOR_INFO}Album not found.{COLOR_RESET}")
+            if "error" in album_info:
+                print(album_info["error"])
+            print("Please enter the rest of the album info manually.")
+            album_year = input("Enter the album year: ").strip()
+            if len(album_year) == 0: album_year = None
+            album_genre = input("Enter the album genre: ").strip()
+            if len(album_genre) == 0: album_genre = None
+        else:
+            album_year = album_info["release_date"][:4]
+            album_genre = album_info["genre"]
+            album_tracks = album_info["tracks"]
+            print(f"{COLOR_SUCCESS}Done.{COLOR_RESET}")
 
-        # Create the output path for the thumbnail
-        os.makedirs(OUTPUT_PATH, exist_ok=True)
+        # Prompt for output format
+        formats_list = ", ".join(FORMATS)
+        format = input(f"Enter the desired output format ({formats_list}): ").strip().lower()
+        if len(format) == 0:
+            print(f"{COLOR_INFO}Defaulting to {FORMATS[0]}.{COLOR_RESET}")
+            format = FORMATS[0]
+        if format not in FORMATS:
+            print(f"{COLOR_ERROR}Invalid format. Supported formats are: {formats_list}{COLOR_RESET}")
+            return
 
-        # Download and use the thumbnail
-        album_artwork = download_youtube_thumbnail(url, OUTPUT_PATH, THUMBNAIL_NAME)
+        # Prompt for YouTube URL
+        url = input("Enter the YouTube video or playlist URL: ").strip()
+        if len(url) == 0:
+            print(f"{COLOR_ERROR}No URL given.{COLOR_RESET}")
+            return
+        
+        # Prompt for artwork, if user wants to override
+        album_artwork = input("Enter the path to the album artwork (or leave blank to use the thumbnail): ").strip()
+        album_artwork_temporary = len(album_artwork) == 0
+        if not album_artwork_temporary:
+            # Use existing file or url
+            if not os.path.exists(album_artwork):
+                # if no file exists, assume it's a URL and download it
+                album_artwork = download_image(album_artwork, OUTPUT_PATH, THUMBNAIL_NAME)
 
-    album = Album(album_name, album_artist, album_year, album_tracks, album_artwork)
+            # Check if the file exists, if not, print an error
+            if not os.path.exists(album_artwork):
+                print(f"{COLOR_ERROR}Artwork path does not exist.{COLOR_RESET}")
+                return
+        else:
+            # Download the thumbnail
+            print(f"{COLOR_INFO}Downloading thumbnail...{COLOR_RESET}")
 
-    # Prompt for output folder
-    output_folder = input(f"Enter the output folder (default: {OUTPUT_PATH}): ").strip()
-    if len(output_folder) == 0:
-        output_folder = OUTPUT_PATH
-    if not os.path.exists(output_folder):
-        print(f"{COLOR_ERROR}Output folder does not exist.{COLOR_RESET}")
-        return
+            # Create the output path for the thumbnail
+            os.makedirs(OUTPUT_PATH, exist_ok=True)
 
-    print("")
-    print(f"\t\t{album.name}:")
-    if "playlist" in url:
-        # Process as a playlist
-        output_folder = download_youtube_playlist(url, OUTPUT_PATH, format, album.get_folder_name(), album)
-    elif "watch" in url:
-        # Process as a single video
-        output_folder = download_youtube_video(url, OUTPUT_PATH, format, album.get_folder_name(), album)
-    else:
-        print(f"{COLOR_ERROR}Invalid URL. Please provide a valid YouTube video or playlist URL.{COLOR_RESET}")
-        return
-    
-    # Delete thumbnail if it was downloaded
-    if album_artwork_temporary and album_artwork:
-        try:
-            os.remove(album_artwork)
-        except Exception as e:
-            print(f"{COLOR_ERROR}Failed to delete thumbnail: {e}{COLOR_RESET}")
-    
-    # Done
-    print("")
-    print(f"Files saved to: {output_folder}")
-    
-    # Open output folder
-    if output_folder:
-        open_directory(output_folder)
+            # Download and use the thumbnail
+            album_artwork = download_youtube_thumbnail(url, OUTPUT_PATH, THUMBNAIL_NAME)
+
+        album = Album(album_name, album_artist, album_year, album_genre, album_tracks, album_artwork)
+
+        # Prompt for output folder
+        output_folder = input(f"Enter the output folder (default: {OUTPUT_PATH}): ").strip()
+        if len(output_folder) == 0:
+            output_folder = OUTPUT_PATH
+        if not os.path.exists(output_folder):
+            print(f"{COLOR_ERROR}Output folder does not exist.{COLOR_RESET}")
+            return
+
+        print("")
+        print(f"\t\t{album.name}:")
+        set_title(album.artist, album.name)
+        album_path = os.path.join(output_folder, album.get_folder_name())
+        if "playlist" in url:
+            # Process as a playlist
+            output_folder = download_youtube_playlist(url, album_path, format, album)
+        elif "watch" in url:
+            # Process as a single video
+            output_folder = download_youtube_video(url, album_path, format, album)
+        else:
+            print(f"{COLOR_ERROR}Invalid URL. Please provide a valid YouTube video or playlist URL.{COLOR_RESET}")
+            return
+        set_title(album.artist, album.name)
+        
+        # Delete thumbnail if it was downloaded
+        if album_artwork_temporary and album_artwork:
+            try:
+                os.remove(album_artwork)
+            except Exception as e:
+                print(f"{COLOR_ERROR}Failed to delete thumbnail: {e}{COLOR_RESET}")
+        
+        # Done
+        print("")
+        print(f"Files saved to: {output_folder}\n")
+        print('Press Enter to run AlbumWorks again or type "exit" to quit.')
+        choice = input()
+        if choice.lower() == "exit":
+            break
+        print("-" * os.get_terminal_size().columns)
 
 if __name__ == "__main__":
     main()
