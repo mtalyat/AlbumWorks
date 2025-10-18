@@ -1,4 +1,5 @@
 import difflib
+import json
 import musicbrainzngs
 import os
 import re
@@ -15,13 +16,118 @@ OUTPUT_PATH = os.path.join(os.path.expanduser("~"), "Music")
 FORMATS = ["mp3", "wav", "mp4a"]
 TEMP_NAME = "temp"
 THUMBNAIL_NAME = "thumbnail"
+UNKNOWN = "Unknown"
+
+ARTWORK_TYPES = ['file', 'url', 'thumbnail']
+ARTWORK_TYPE_FILE = 0 # file on disk
+ARTWORK_TYPE_LINK = 1 # link to an online image
+ARTWORK_TYPE_THUMBNAIL = 2 # YouTube thumbnail
 
 COLOR_ERROR = "\033[91m"
 COLOR_SUCCESS = "\033[92m"
 COLOR_INFO = "\033[90m"
 COLOR_RESET = "\033[0m"
 
-def find_closest_string_index(target, string_list):
+def increment_or_add_suffix(string):
+    """
+    Adds a "2" to the end of the string if it doesn't end with a number,
+    or increments the number at the end by 1 if it does.
+
+    Args:
+        string (str): The input string.
+
+    Returns:
+        str: The modified string.
+    """
+    # Match a number at the end of the string
+    match = re.search(r' (\d+)$', string)
+    if match:
+        # Increment the number
+        number = int(match.group(1))
+        incremented_number = number + 1
+        return string[:match.start()] + str(incremented_number)
+    else:
+        # Add "2" to the end
+        return string + " 2"
+
+def fix_for_path(path):
+    # Remove illegal characters for file and folder names
+    path = re.sub(r'[<>:"/\\|?*]', '', path)
+    return path.strip()
+
+class Title:
+    def __init__(self, title):
+        self.set_title(title)
+    
+    def __repr__(self):
+        return self.displayName
+    
+    def set_title(self, title):
+        self.displayName = title
+        self.fileName = fix_for_path(title)
+    
+    def fix_title(self, album = None):
+        """
+        Cleans up the YouTube title by removing unwanted text and illegal characters.
+
+        Args:
+            title (str): The original YouTube title.
+
+        Returns:
+            str: The sanitized title.
+        """
+        title = self.displayName
+
+        # Remove "(...)" text"
+        title = re.sub(r'(\(.*?\))', '', title, flags=re.IGNORECASE)
+
+        # Remove any common words or phrases "OST"
+        title = re.sub(r'\b(OST|Lyrics|(Full )?Album)\b', '', title, flags=re.IGNORECASE)
+
+        # Remove anything past '|'
+        title = re.sub(r'\|.*$', '', title, flags=re.IGNORECASE)
+
+        # If there is a quote block, return that
+        quote_pattern = r'"(.+?)"'
+        quote_match = re.search(quote_pattern, title)
+        if quote_match:
+            title = quote_match.group(1)
+
+        # Remove any numbers at the start of the title
+        title = re.sub(r'^\d+[).]?\s*', '', title, flags=re.IGNORECASE)
+
+        # Remove " - "or " | ", etc.
+        title = re.sub(r' ?[-|] ?', '', title)
+
+        # Remove leading or trailing whitespace and punctuation
+        title = re.sub(r'^[^a-zA-Z0-9\(]+|[^a-zA-Z0-9\)]+$', '', title)
+
+        # If no album, done here
+        if not album:
+            self.set_title(title)
+            return
+        
+        # Remove any mention of the artist name
+        title = re.sub(rf'{album.artist}', '', title, flags=re.IGNORECASE).strip()
+
+        # Remove any mention of the album name
+        temp = re.sub(rf'{album.name}', '', title, flags=re.IGNORECASE).strip()
+
+        # If the title is empty, use the album name
+        empty_pattern = r'^[^a-zA-Z0-9]*$'
+        if re.fullmatch(empty_pattern, temp):
+            title = album.name
+        else:
+            title = temp
+
+        # If there is a match to a track, use that instead
+        track_index = album.get_track_index(title, False)
+        if track_index != -1:
+            title = album.tracks[track_index]
+
+        self.set_title(title)
+
+def find_closest_string_index(target: str, string_list):
     """
     Finds the index of the closest string in a list to the given target string.
 
@@ -32,13 +138,27 @@ def find_closest_string_index(target, string_list):
     Returns:
         int: The index of the closest matching string, or -1 if no match is found.
     """
-    matches = difflib.get_close_matches(target, string_list, n=1, cutoff=0.8)
-    if matches:
-        closest_match = matches[0]
-        return string_list.index(closest_match)
+    # replace fancy quotes with normal quotes
+    target = re.sub(r'[‘’]', '\'', re.sub(r'[“”]', '"', target)).lower()
+    string_list = [re.sub(r'[‘’]', '\'', re.sub(r'[“”]', '"', s)).lower() for s in string_list]  # Normalize case for comparison
+
+    # # try matching closest string using difflib
+    # matches = difflib.get_close_matches(target, string_list, n=1, cutoff=0.8)
+    # if matches:
+    #     closest_match = matches[0]
+    #     return string_list.index(closest_match)
+    # try matching the first string that starts with the target
+    for i, string in enumerate(string_list):
+        if string.startswith(target):
+            return i
+    # try the opposite
+    for i, string in enumerate(string_list):
+        if string in target:
+            return i
+    # not found
     return -1
 
-def set_title(artist = None, album = None, song = None):
+def set_console_title(artist = None, album = None, song = None):
     """Sets the console title to the current album, artist, and song."""
     if artist is None:
         artist = ""
@@ -64,7 +184,7 @@ class Album:
         self.tracks = tracks if tracks else []
         self.lowered_tracks = [track.lower() for track in tracks] if tracks else []
 
-    def get_track_index(self, name):
+    def get_track_index(self, name, addIfNotFound=True):
         """
         Finds the index of a track by its name.
 
@@ -75,7 +195,7 @@ class Album:
             int: The index of the track, or -1 if not found.
         """
         index = find_closest_string_index(name.lower(), self.lowered_tracks)
-        if index != -1:
+        if index != -1 or not addIfNotFound:
             # Existing track found
             return index
         # Add new track
@@ -91,7 +211,7 @@ class Album:
         Returns:
             str: The sanitized folder name.
         """
-        return fix_path(f"{self.artist} - {self.name}")
+        return fix_for_path(f"{self.artist} - {self.name}")
     
 def update_metadata(file_path, title, artist, album, track_number, year=None, genre=None, artwork=None):
     """
@@ -188,8 +308,8 @@ def parse_timestamps(description):
     # 1. "0:00 Segment Name"
     # 2. "Segment Name 0:00"
     TIME_PATTERN = r"\[?(\d+:\d{2}(?::\d{2})?)\]?"
-    NUMBER_PATTERN = r"(?:\d+\.?\)?)?\s*"
-    NAME_PATTERN = r"(.+)"
+    NUMBER_PATTERN = r"(?:\d+[\.\)\s])?\s*"
+    NAME_PATTERN = r"\W*(\w.*)"
     before_pattern = fr"^{NUMBER_PATTERN}{TIME_PATTERN}\s+{NAME_PATTERN}"
     after_pattern = fr"^{NUMBER_PATTERN}{NAME_PATTERN}\s+{TIME_PATTERN}"
     for line in lines:
@@ -203,31 +323,11 @@ def parse_timestamps(description):
         # Split the time string into components
         time_parts = list(map(int, time.split(":")))
         # Convert to total seconds (supports hours:minutes:seconds or minutes:seconds)
-        total_seconds = sum(x * 60 ** i for i, x in enumerate(reversed(time_parts)))
+        total_seconds = time_parts[-1] # seconds
+        total_seconds += time_parts[-2] * 60 # minutes
+        if len(time_parts) >= 3: total_seconds += time_parts[-3] * 3600 # hours
         segments.append((total_seconds, name.strip()))
     return segments
-
-def increment_or_add_suffix(string):
-    """
-    Adds a "2" to the end of the string if it doesn't end with a number,
-    or increments the number at the end by 1 if it does.
-
-    Args:
-        string (str): The input string.
-
-    Returns:
-        str: The modified string.
-    """
-    # Match a number at the end of the string
-    match = re.search(r' (\d+)$', string)
-    if match:
-        # Increment the number
-        number = int(match.group(1))
-        incremented_number = number + 1
-        return string[:match.start()] + str(incremented_number)
-    else:
-        # Add "2" to the end
-        return string + " 2"
 
 def split_audio(file_path, segments, output_folder, format, album):
     """
@@ -253,24 +353,35 @@ def split_audio(file_path, segments, output_folder, format, album):
             frames = audio.readframes(end_frame - start_frame)
 
             # Save the segment with the given name
-            title = fix_title(name, album)
+            title = Title(name)
+            title.fix_title(album)
             track_index = album.get_track_index(title)
-
-            # If a duplicate, increment the title
-            while track_index in used:
-                title = increment_or_add_suffix(title)
-                track_index = album.get_track_index(title)
-
             used.add(track_index)
 
             print(f"\t{track_index + 1}) {title}")
-            set_title(album.artist, album.name, title)
+            set_console_title(album.artist, album.name, title)
             output_path = os.path.join(output_folder, f"{title}.wav")
             with wave.open(output_path, "wb") as segment:
                 segment.setparams(params)
                 segment.writeframes(frames)
             final_file = convert_file(output_path, format)
             update_metadata_with_album(final_file, album)
+
+def get_path_with_format(path, format):
+    """
+    Returns the path with the specified format.
+
+    Args:
+        path (str): The original file path.
+        format (str): The desired output format (e.g., 'mp3', 'wav', 'mp4a').
+
+    Returns:
+        str: The path with the new format.
+    """
+    base, _ = os.path.splitext(path)
+    if format.startswith('.'):
+        format = format[1:]  # Remove leading dot if present
+    return f"{base}.{format}"
 
 def convert_file(path, format):
     """
@@ -284,13 +395,19 @@ def convert_file(path, format):
         str: Path to the converted file.
     """
     # Get the base name and current extension of the file
-    base, ext = os.path.splitext(path)
+    _, ext = os.path.splitext(path)
     current_format = ext[1:]  # Remove the leading dot from the extension
-    target_path = f"{base}.{format}"  # Target file path with the new format
-
     # If the file is already in the desired format, return the original path
     if current_format == format:
         return path
+    # If file already exists in the target format, increment the path
+    target_path = get_path_with_format(path, format)
+    # Get the folder path and title from the original path
+    base = os.path.dirname(path)
+    title = os.path.splitext(os.path.basename(path))[0]
+    while os.path.exists(target_path):
+        title = increment_or_add_suffix(title)
+        target_path = os.path.join(base, f"{title}.wav")
 
     # Define the ffmpeg command for conversion
     command = [
@@ -346,6 +463,7 @@ def get_album_info(album_name, artist_name):
                 "name": release["title"],
                 "artist": release["artist-credit"][0]["artist"]["name"],
                 "release_date": release.get("date", "Unknown"),
+                "genre": release.get("genre-list", [{}])[0].get("name") if release.get("genre-list") else None,
                 "tracks": [],
                 "url": f"https://musicbrainz.org/release/{release['id']}"
             }
@@ -362,60 +480,174 @@ def get_album_info(album_name, artist_name):
     except Exception as e:
         return {"error": f"An error occurred: {e}"}
 
-def fix_path(path):
-    # Remove illegal characters for file and folder names
-    path = re.sub(r'[<>:"/\\|?*]', '', path)
-    return path.strip()
-
-def fix_title(title, album = None):
+def search_wikipedia_album_artwork(album_name, artist_name):
     """
-    Cleans up the YouTube title by removing unwanted text and illegal characters.
-
+    Searches Wikipedia for an album or related page and returns the direct link to its cover artwork image.
+    
     Args:
-        title (str): The original YouTube title.
-
+        album_name (str): The name of the album.
+        artist_name (str): The name of the artist.
+    
     Returns:
-        str: The sanitized title.
+        str or None: Direct URL to the album artwork image, or None if not found.
     """
-    # Remove "(...)" text"
-    title = re.sub(r'(\(.*\))', '', title, flags=re.IGNORECASE)
+    try:
+        # Wikipedia API endpoint
+        wiki_api_url = "https://en.wikipedia.org/api/rest_v1/page/summary/"
+        
+        # Headers to avoid being blocked
+        headers = {
+            'User-Agent': 'AlbumWorks/1.0 (https://github.com/mtalyat/AlbumWorks; contact@example.com)'
+        }
+        
+        # Try different search variations
+        search_terms = [
+            f"{album_name} ({artist_name} album)",
+            f"{album_name} album {artist_name}",
+            f"{album_name}",
+            f"{album_name} (album)",
+            f"{album_name} {artist_name}",
+            f"{album_name} (video game)",
+            f"{album_name} ({artist_name})",
+            f"{artist_name} {album_name}"
+        ]
+        
+        for search_term in search_terms:
+            # Format the search term for URL
+            formatted_term = search_term.replace(" ", "_")
+            
+            try:
+                # Get page summary
+                response = requests.get(f"{wiki_api_url}{formatted_term}", headers=headers)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    
+                    # Check if this looks like an album, soundtrack, or related page
+                    description = data.get("description", "").lower()
+                    extract = data.get("extract", "").lower()
+                    
+                    # Look for album, soundtrack, video game, or music-related keywords
+                    relevant_keywords = ["album", "soundtrack", "video game", "music", "single", "ep", "ost"]
+                    
+                    if any(keyword in description or keyword in extract for keyword in relevant_keywords):
+                        # Get the thumbnail image
+                        if "thumbnail" in data and "source" in data["thumbnail"]:
+                            thumbnail_url = data["thumbnail"]["source"]
+                            
+                            # Try to get the full resolution image
+                            full_image_url = get_full_wikipedia_image(data.get("title", ""), thumbnail_url)
+                            
+                            return full_image_url or thumbnail_url
+                        
+            except requests.exceptions.RequestException:
+                continue  # Try next search term
+        
+        # If no direct match found, try Wikipedia search API
+        return search_wikipedia_with_search_api(album_name, artist_name)
+        
+    except Exception as e:
+        print(f"{COLOR_ERROR}Error searching Wikipedia: {e}{COLOR_RESET}")
+        return None
 
-    # Remove any common words or phrases "OST"
-    title = re.sub(r'\b(OST|Lyrics)\b', '', title, flags=re.IGNORECASE)
+def get_full_wikipedia_image(page_title, thumbnail_url):
+    """
+    Attempts to get the full resolution version of a Wikipedia image.
+    
+    Args:
+        page_title (str): The Wikipedia page title.
+        thumbnail_url (str): The thumbnail URL.
+    
+    Returns:
+        str or None: Full resolution image URL, or None if not found.
+    """
+    try:
+        # Headers for requests
+        headers = {
+            'User-Agent': 'AlbumWorks/1.0 (https://github.com/mtalyat/AlbumWorks; contact@example.com)'
+        }
+        
+        # Extract the filename from the thumbnail URL
+        if "/thumb/" in thumbnail_url:
+            # Extract the original filename
+            parts = thumbnail_url.split("/thumb/")
+            if len(parts) > 1:
+                # Get the part after /thumb/
+                after_thumb = parts[1]
+                # Split by / and take the first part (original filename)
+                filename = after_thumb.split("/")[0]
+                
+                # Construct the full resolution URL
+                full_url = f"https://upload.wikimedia.org/wikipedia/en/{filename}"
+                
+                # Test if the full resolution image exists
+                response = requests.head(full_url, headers=headers)
+                if response.status_code == 200:
+                    return full_url
+                
+                # Try commons if en doesn't work
+                full_url = f"https://upload.wikimedia.org/wikipedia/commons/{filename}"
+                response = requests.head(full_url, headers=headers)
+                if response.status_code == 200:
+                    return full_url
+        
+        return None
+        
+    except Exception:
+        return None
 
-    # Remove anything past '|'
-    title = re.sub(r'\|.*$', '', title, flags=re.IGNORECASE)
-
-    # Remove any mention of the artist name
-    if album:
-        title = re.sub(rf'\b{re.escape(album.artist)}\b', '', title, flags=re.IGNORECASE)
-
-    # Remove " - "or " | ", etc.
-    title = re.sub(r' ?[-|] ?', '', title)
-
-    # Remove leading or trailing whitespace and punctuation
-    title = re.sub(r'^[^a-zA-Z0-9\(]+|[^a-zA-Z0-9\)]+$', '', title)
-
-    # If no album, done here
-    if not album:
-        return fix_path(title)
-
-    # Remove any mention of the album name
-    temp = re.sub(rf'\b{re.escape(album.name)}\b', '', title, flags=re.IGNORECASE).strip()
-
-    # If the title is empty, use the album name
-    empty_pattern = r'^[^a-zA-Z0-9]*$'
-    if re.fullmatch(empty_pattern, temp):
-        title = album.name
-    else:
-        title = temp
-
-    # If there is a match to a track, use that instead
-    track_index = album.get_track_index(title)
-    if track_index != -1:
-        title = album.tracks[track_index]
-
-    return fix_path(title)
+def search_wikipedia_with_search_api(album_name, artist_name):
+    """
+    Uses Wikipedia's search API as a fallback method.
+    
+    Args:
+        album_name (str): The name of the album.
+        artist_name (str): The name of the artist.
+    
+    Returns:
+        str or None: Image URL if found, None otherwise.
+    """
+    try:
+        search_api_url = "https://en.wikipedia.org/api/rest_v1/page/search"
+        
+        # Headers to avoid being blocked
+        headers = {
+            'User-Agent': 'AlbumWorks/1.0 (https://github.com/mtalyat/AlbumWorks; contact@example.com)'
+        }
+        
+        # Search for the album
+        search_query = f"{album_name} {artist_name} album"
+        params = {
+            "q": search_query,
+            "limit": 5
+        }
+        
+        response = requests.get(search_api_url, params=params, headers=headers)
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            if "pages" in data:
+                for page in data["pages"]:
+                    # Check if this looks like an album page
+                    if "album" in page.get("description", "").lower():
+                        # Get the page summary to find the image
+                        page_title = page["title"].replace(" ", "_")
+                        summary_response = requests.get(f"https://en.wikipedia.org/api/rest_v1/page/summary/{page_title}", headers=headers)
+                        
+                        if summary_response.status_code == 200:
+                            summary_data = summary_response.json()
+                            
+                            if "thumbnail" in summary_data and "source" in summary_data["thumbnail"]:
+                                thumbnail_url = summary_data["thumbnail"]["source"]
+                                full_image_url = get_full_wikipedia_image(page_title, thumbnail_url)
+                                
+                                return full_image_url or thumbnail_url
+        
+        return None
+        
+    except Exception:
+        return None
 
 def download_youtube_video(url, output_folder, format, album):
     """
@@ -438,12 +670,14 @@ def download_youtube_video(url, output_folder, format, album):
 
         # Print index and title, if no segments found
         if not segments:
-            title = fix_title(yt.title, album)
-            track_index = album.get_track_index(title)
+            title = Title(yt.title)
+            title.fix_title(album)
+            track_index = album.get_track_index(str(title))
             print(f"\t{track_index + 1}) {title}")
-            set_title(album.artist, album.name, title)
+            set_console_title(album.artist, album.name, title)
         else:
-            title = fix_title(yt.title, album)
+            title = Title(yt.title)
+            title.fix_title(album)
 
         # Get the audio stream
         audio_stream = yt.streams.filter(only_audio=True).first()
@@ -455,9 +689,12 @@ def download_youtube_video(url, output_folder, format, album):
         downloaded_file = audio_stream.download(output_path=output_folder)
 
         # Rename to use the safe title
-        file_name = TEMP_NAME if segments else title
+        file_name = TEMP_NAME if segments else title.fileName
         file_name = os.path.join(output_folder, f"{file_name}.mp4")
-        os.rename(downloaded_file, file_name)
+
+        # If the file already exists, replace it
+        if not os.path.exists(file_name):
+            os.rename(downloaded_file, file_name)
         downloaded_file = file_name
 
         # if no segments are found, convert to target format and return
@@ -577,8 +814,19 @@ def download_image(url, output_folder, name):
         # Define the output file path
         image_path = os.path.join(output_folder, f"{name}.jpg")
 
+        # Set headers to mimic a real browser request
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
+        }
+
         # Download the image
-        response = requests.get(url, stream=True)
+        response = requests.get(url, stream=True, headers=headers)
         if response.status_code == 200:
             with open(image_path, "wb") as file:
                 for chunk in response.iter_content(1024):
@@ -607,93 +855,157 @@ def open_directory(path):
     else:
         print(f"{COLOR_ERROR}The directory does not exist: {path}{COLOR_RESET}")
 
+def print_line():
+    print("-" * os.get_terminal_size().columns)
+
 def main():
     os.system("cls")
     print("Welcome to the AlbumWorks downloader!")
     print("You can download individual videos or entire playlists.")
-    print("")
+    print()
+    print("Setup:")
+    
+    # Prompt for output format
+    formats_list = ", ".join(FORMATS)
+    format = input(f"Enter the desired output format ({formats_list}): ").strip().lower()
+    if len(format) == 0:
+        print(f"{COLOR_INFO}Defaulting to {FORMATS[0]}.{COLOR_RESET}")
+        format = FORMATS[0]
+    if format not in FORMATS:
+        print(f"{COLOR_ERROR}Invalid format. Supported formats are: {formats_list}{COLOR_RESET}")
+        return
+    
+    # Prompt for output folder
+    base_output_folder = input(f"Enter the output folder (default: {OUTPUT_PATH}): ").strip()
+    if len(base_output_folder) == 0:
+        base_output_folder = OUTPUT_PATH
+    if not os.path.exists(base_output_folder):
+        print(f"{COLOR_ERROR}Output folder does not exist.{COLOR_RESET}")
+        return
+
+    print()
+    
     while True:
-        set_title()
+        print_line()
+        set_console_title()
+        output_folder = base_output_folder
+
         # Prompt for album information
         album_artist = input("Enter the album artist: ").strip()
-        if len(album_artist) == 0:
-            print(f"{COLOR_ERROR}No album artist given.{COLOR_RESET}")
-            return
         album_name = input("Enter the album name: ").strip()
-        if len(album_name) == 0:
-            print(f"{COLOR_ERROR}No album name given.{COLOR_RESET}")
-            return
-        print(f"{COLOR_INFO}Retrieving album information...{COLOR_RESET}")
-        album_info = get_album_info(album_name, album_artist)
+        album_info = None
+        if len(album_artist) > 0 and len(album_name) > 0:
+            print(f"{COLOR_INFO}Retrieving album information...{COLOR_RESET}")
+            album_info = get_album_info(album_name, album_artist)
         album_year = None
         album_tracks = None
-        if "not found" in album_info or "error" in album_info or album_info["artist"] != album_artist:
+        if album_info is None or "not found" in album_info or "error" in album_info or album_info["artist"] != album_artist:
             print(f"{COLOR_INFO}Album not found.{COLOR_RESET}")
-            if "error" in album_info:
+            if album_info is not None and "error" in album_info:
                 print(album_info["error"])
             print("Please enter the rest of the album info manually.")
             album_year = input("Enter the album year: ").strip()
             if len(album_year) == 0: album_year = None
             album_genre = input("Enter the album genre: ").strip()
             if len(album_genre) == 0: album_genre = None
+            album_tracks = []
+            track_index = 0
+            while True:
+                track_number = input(f"Enter the track number, q to quit, or leave blank for number {track_index + 1}: ").strip()
+                if track_number == "q":
+                    break
+                if len(track_number) != 0:
+                    try:
+                            track_index = int(track_number) - 1
+                    except ValueError:
+                        print(f"{COLOR_ERROR}Invalid track number. Please enter a valid number.{COLOR_RESET}")
+                        continue
+                while len(album_tracks) <= track_index:
+                    album_tracks.append(None)
+                track_name = input(f"Enter the name for track {track_index + 1}: ").strip()
+                album_tracks[track_index] = track_name
+                track_index += 1
         else:
             album_year = album_info["release_date"][:4]
-            album_genre = album_info["genre"]
+            album_genre = None
             album_tracks = album_info["tracks"]
-            print(f"{COLOR_SUCCESS}Done.{COLOR_RESET}")
 
-        # Prompt for output format
-        formats_list = ", ".join(FORMATS)
-        format = input(f"Enter the desired output format ({formats_list}): ").strip().lower()
-        if len(format) == 0:
-            print(f"{COLOR_INFO}Defaulting to {FORMATS[0]}.{COLOR_RESET}")
-            format = FORMATS[0]
-        if format not in FORMATS:
-            print(f"{COLOR_ERROR}Invalid format. Supported formats are: {formats_list}{COLOR_RESET}")
-            return
+        # Print album information    
+        print(f'''
+Album Information:
+    Artist: {album_artist}
+    Title: {album_name}
+    Year: {album_year if album_year else UNKNOWN}
+    Genre: {album_genre if album_genre else UNKNOWN}
+    Tracks: {str(len(album_tracks)) if album_tracks else UNKNOWN}''')
+        for i, track in enumerate(album_tracks):
+            print(f"\t{i + 1}) {track if track else UNKNOWN}")
+        print()
 
         # Prompt for YouTube URL
         url = input("Enter the YouTube video or playlist URL: ").strip()
         if len(url) == 0:
             print(f"{COLOR_ERROR}No URL given.{COLOR_RESET}")
             return
-        
-        # Prompt for artwork, if user wants to override
-        album_artwork = input("Enter the path to the album artwork (or leave blank to use the thumbnail): ").strip()
-        album_artwork_temporary = len(album_artwork) == 0
-        if not album_artwork_temporary:
-            # Use existing file or url
-            if not os.path.exists(album_artwork):
-                # if no file exists, assume it's a URL and download it
-                album_artwork = download_image(album_artwork, OUTPUT_PATH, THUMBNAIL_NAME)
 
-            # Check if the file exists, if not, print an error
-            if not os.path.exists(album_artwork):
-                print(f"{COLOR_ERROR}Artwork path does not exist.{COLOR_RESET}")
-                return
+        # Search for the album artwork
+        print(f"{COLOR_INFO}Searching for album artwork...{COLOR_RESET}")
+
+        wiki_artwork_url = search_wikipedia_album_artwork(album_name, album_artist)
+        if wiki_artwork_url:
+            print(f"{COLOR_INFO}Found album artwork on Wikipedia: {wiki_artwork_url}{COLOR_RESET}")
+            album_artwork = wiki_artwork_url
+            album_artwork_type = ARTWORK_TYPE_LINK
+            album_artwork = input("Enter the path to the album artwork, \"thumbnail\" to use the YouTube thumbnail, or nothing/\"wiki\" for the Wikipedia artwork: ").strip()
+
+            # Prompt for artwork, if user wants to override
+            if len(album_artwork) == 0 or album_artwork.lower() == "wiki":
+                album_artwork = wiki_artwork_url
+                album_artwork_type = ARTWORK_TYPE_LINK
+            elif album_artwork.lower() == "thumbnail":
+                album_artwork_type = ARTWORK_TYPE_THUMBNAIL
+            elif os.path.exists(album_artwork):
+                album_artwork_type = ARTWORK_TYPE_FILE
+            else:
+                album_artwork_type = ARTWORK_TYPE_LINK
         else:
-            # Download the thumbnail
-            print(f"{COLOR_INFO}Downloading thumbnail...{COLOR_RESET}")
+            print(f"{COLOR_INFO}No artwork found.{COLOR_RESET}")
+            album_artwork = input("Enter the path to the album artwork, or nothing/\"thumbnail\" for the thumbnail: ").strip()
 
-            # Create the output path for the thumbnail
-            os.makedirs(OUTPUT_PATH, exist_ok=True)
+            # Prompt for artwork, if user wants to override
+            if len(album_artwork) == 0 or album_artwork.lower() == "thumbnail":
+                album_artwork_type = ARTWORK_TYPE_THUMBNAIL
+            elif os.path.exists(album_artwork):
+                album_artwork_type = ARTWORK_TYPE_FILE
+            else:
+                album_artwork_type = ARTWORK_TYPE_LINK
 
-            # Download and use the thumbnail
+        # Make sure the output path exists
+        os.makedirs(OUTPUT_PATH, exist_ok=True)
+        
+        if album_artwork_type == ARTWORK_TYPE_LINK:
+            # Download the artwork from the link
+            album_artwork_temporary = True
+            album_artwork = download_image(album_artwork, OUTPUT_PATH, THUMBNAIL_NAME)
+        elif album_artwork_type == ARTWORK_TYPE_FILE:
+            # Use the existing file
+            album_artwork_temporary = False
+            if not os.path.exists(album_artwork):
+                print(f"{COLOR_ERROR}Artwork file does not exist: {album_artwork}{COLOR_RESET}")
+                return
+        elif album_artwork_type == ARTWORK_TYPE_THUMBNAIL:
+            # Use the YouTube thumbnail
+            album_artwork_temporary = True
             album_artwork = download_youtube_thumbnail(url, OUTPUT_PATH, THUMBNAIL_NAME)
+        else:
+            print(f"{COLOR_ERROR}Invalid artwork type.{COLOR_RESET}")
+            return
 
         album = Album(album_name, album_artist, album_year, album_genre, album_tracks, album_artwork)
 
-        # Prompt for output folder
-        output_folder = input(f"Enter the output folder (default: {OUTPUT_PATH}): ").strip()
-        if len(output_folder) == 0:
-            output_folder = OUTPUT_PATH
-        if not os.path.exists(output_folder):
-            print(f"{COLOR_ERROR}Output folder does not exist.{COLOR_RESET}")
-            return
-
         print("")
         print(f"\t\t{album.name}:")
-        set_title(album.artist, album.name)
+        set_console_title(album.artist, album.name)
         album_path = os.path.join(output_folder, album.get_folder_name())
         if "playlist" in url:
             # Process as a playlist
@@ -704,10 +1016,10 @@ def main():
         else:
             print(f"{COLOR_ERROR}Invalid URL. Please provide a valid YouTube video or playlist URL.{COLOR_RESET}")
             return
-        set_title(album.artist, album.name)
+        set_console_title(album.artist, album.name)
         
         # Delete thumbnail if it was downloaded
-        if album_artwork_temporary and album_artwork:
+        if album_artwork_temporary and os.path.exists(album_artwork):
             try:
                 os.remove(album_artwork)
             except Exception as e:
@@ -720,7 +1032,6 @@ def main():
         choice = input()
         if choice.lower() == "exit":
             break
-        print("-" * os.get_terminal_size().columns)
 
 if __name__ == "__main__":
     main()
