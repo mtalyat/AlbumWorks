@@ -1,5 +1,3 @@
-import difflib
-import json
 import musicbrainzngs
 import os
 import re
@@ -9,7 +7,7 @@ import wave
 from pytubefix import YouTube, Playlist
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3, APIC
-import sys
+import threading
 
 FFMPEG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "ffmpeg", "bin", "ffmpeg.exe")
 OUTPUT_PATH = os.path.join(os.path.expanduser("~"), "Music")
@@ -27,6 +25,36 @@ COLOR_ERROR = "\033[91m"
 COLOR_SUCCESS = "\033[92m"
 COLOR_INFO = "\033[90m"
 COLOR_RESET = "\033[0m"
+
+class ProgressBar:
+    def __init__(self, total, width=50):
+        self.total = total
+        self.current = 0
+        self.lock = threading.Lock()
+        self.width = width
+
+        self.display()
+
+    def update(self, progress):
+        with self.lock:
+            self.current += progress
+            self.display()
+
+    def increment(self):
+        self.update(1)
+
+    def display(self):
+        if self.current > self.total:
+            self.current = self.total
+        if self.current == self.total:
+            print(f"\rProgress: [{'#' * self.width}] 100%")
+            return
+        percent = (self.current / self.total * 100) if self.total else 0
+        bar_length = int(self.width * percent / 100)
+        bar = "#" * bar_length + "-" * (self.width - bar_length)
+        print(f"\rProgress: [{bar}] {percent:.0f}%", end="")
+
+g_progress_bar: ProgressBar = None
 
 def increment_or_add_suffix(string):
     """
@@ -338,34 +366,41 @@ def split_audio(file_path, segments, output_folder, format, album):
         segments (list): List of tuples (start_time, segment_name).
         output_folder (str): Folder to save the split audio files.
     """
-    used = set()
+    def split_segment(i, start_time, name, params, frame_rate):
+        # Determine the start and end frames
+        start_frame = int(start_time * frame_rate)
+        end_frame = int(segments[i + 1][0] * frame_rate) if i + 1 < len(segments) else params.nframes
+
+        # Set the position and read frames
+        audio.setpos(start_frame)
+        frames = audio.readframes(end_frame - start_frame)
+
+        # Save the segment with the given name
+        title = Title(name)
+        title.fix_title(album)
+
+        output_path = os.path.join(output_folder, f"{title}.wav")
+        with wave.open(output_path, "wb") as segment:
+            segment.setparams(params)
+            segment.writeframes(frames)
+        final_file = convert_file(output_path, format)
+        update_metadata_with_album(final_file, album)
+
     with wave.open(file_path, "rb") as audio:
         params = audio.getparams()
         frame_rate = params.framerate
 
-        for i, (start_time, name) in enumerate(segments):
-            # Determine the start and end frames
-            start_frame = int(start_time * frame_rate)
-            end_frame = int(segments[i + 1][0] * frame_rate) if i + 1 < len(segments) else params.nframes
+    threads = []
+    global g_progress_bar
+    g_progress_bar = ProgressBar(len(segments))
+    for i, (start_time, name) in enumerate(segments):
+        thread = threading.Thread(target=split_segment, args=(i, start_time, name, params, frame_rate))
+        threads.append(thread)
+        thread.start()
 
-            # Set the position and read frames
-            audio.setpos(start_frame)
-            frames = audio.readframes(end_frame - start_frame)
-
-            # Save the segment with the given name
-            title = Title(name)
-            title.fix_title(album)
-            track_index = album.get_track_index(title)
-            used.add(track_index)
-
-            print(f"\t{track_index + 1}) {title}")
-            set_console_title(album.artist, album.name, title)
-            output_path = os.path.join(output_folder, f"{title}.wav")
-            with wave.open(output_path, "wb") as segment:
-                segment.setparams(params)
-                segment.writeframes(frames)
-            final_file = convert_file(output_path, format)
-            update_metadata_with_album(final_file, album)
+    for thread in threads:
+        thread.join()
+        g_progress_bar.increment()
 
 def get_path_with_format(path, format):
     """
@@ -669,15 +704,8 @@ def download_youtube_video(url, output_folder, format, album):
         title = yt.title
 
         # Print index and title, if no segments found
-        if not segments:
-            title = Title(yt.title)
-            title.fix_title(album)
-            track_index = album.get_track_index(str(title))
-            print(f"\t{track_index + 1}) {title}")
-            set_console_title(album.artist, album.name, title)
-        else:
-            title = Title(yt.title)
-            title.fix_title(album)
+        title = Title(yt.title)
+        title.fix_title(album)
 
         # Get the audio stream
         audio_stream = yt.streams.filter(only_audio=True).first()
@@ -735,8 +763,18 @@ def download_youtube_playlist(playlist_url, output_folder, format, album):
         os.makedirs(output_folder, exist_ok=True)
 
         # Iterate through all videos in the playlist
+        global g_progress_bar
+        g_progress_bar = ProgressBar(len(playlist.video_urls))
+        threads = []
         for video_url in playlist.video_urls:
-            download_youtube_video(video_url, output_folder, format, album)
+            thread = threading.Thread(target=download_youtube_video, args=(video_url, output_folder, format, album))
+            threads.append(thread)
+            thread.start()
+        
+        # Wait for all threads to complete
+        for thread in threads:
+            thread.join()
+            g_progress_bar.increment()
 
         print(f"{COLOR_SUCCESS}Playlist downloaded successfully: {playlist.title}{COLOR_RESET}")
 
@@ -835,8 +873,6 @@ def download_image(url, output_folder, name):
         else:
             print(f"{COLOR_ERROR}Failed to download image. HTTP Status Code: {response.status_code}{COLOR_RESET}")
             return None
-        
-        return image_path
 
     except Exception as e:
         print(f"{COLOR_ERROR}An error occurred while downloading the image: {e}{COLOR_RESET}")
@@ -1003,9 +1039,6 @@ Album Information:
 
         album = Album(album_name, album_artist, album_year, album_genre, album_tracks, album_artwork)
 
-        print("")
-        print(f"\t\t{album.name}:")
-        set_console_title(album.artist, album.name)
         album_path = os.path.join(output_folder, album.get_folder_name())
         if "playlist" in url:
             # Process as a playlist
