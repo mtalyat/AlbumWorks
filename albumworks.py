@@ -1,3 +1,4 @@
+import difflib
 import musicbrainzngs
 import os
 import re
@@ -74,6 +75,7 @@ class Worker:
             if not id in self.tasks:
                 self.tasks[id] = WorkerTask(0)
             self.tasks[id].set(self.task_weight)
+        self.display()
         
     def wait_for_task(self, id):
         while True:
@@ -232,23 +234,39 @@ def find_closest_string_index(target: str, string_list, used: list[bool]) -> int
     Returns:
         int: The index of the closest matching string, or -1 if no match is found.
     """
+    def _find_closest_string_index(target: str, string_list, used: list[bool]) -> int:
+        # try matching the first string that starts with the target
+        for i, string in enumerate(string_list):
+            if string.startswith(target) and not used[i]:
+                return i
+        # try the opposite
+        for i, string in enumerate(string_list):
+            if string in target and not used[i]:
+                return i
+        # try matching closest string using difflib
+        matches = difflib.get_close_matches(target, string_list, n=1, cutoff=0.8)
+        if matches:
+            closest_match = matches[0]
+            i = string_list.index(closest_match)
+            if not used[i]:
+                return i
+        return -1
+    
     # replace fancy quotes with normal quotes
     target = re.sub(r'[‘’]', '\'', re.sub(r'[“”]', '"', target)).lower()
     string_list = [re.sub(r'[‘’]', '\'', re.sub(r'[“”]', '"', s)).lower() for s in string_list]  # Normalize case for comparison
-
-    # # try matching closest string using difflib
-    # matches = difflib.get_close_matches(target, string_list, n=1, cutoff=0.8)
-    # if matches:
-    #     closest_match = matches[0]
-    #     return string_list.index(closest_match)
-    # try matching the first string that starts with the target
-    for i, string in enumerate(string_list):
-        if string.startswith(target) and not used[i]:
-            return i
-    # try the opposite
-    for i, string in enumerate(string_list):
-        if string in target and not used[i]:
-            return i
+    
+    index = _find_closest_string_index(target, string_list, used)
+    if index != -1:
+        return index
+    
+    # try again but remove all (...) and [...]
+    target_cleaned = re.sub(r'(\[.*?\]|\(.*?\))', '', target).strip()
+    string_list_cleaned = [re.sub(r'(\[.*?\]|\(.*?\))', '', s).strip() for s in string_list]
+    index = _find_closest_string_index(target_cleaned, string_list_cleaned, used)
+    if index != -1:
+        return index
+    
     # not found
     return -1
 
@@ -311,7 +329,10 @@ Album Information:
     Tracks: {str(len(self.tracks)) if self.tracks else UNKNOWN}''')
         for i, track in enumerate(self.tracks):
             print(f"\t{i + 1}) {track if track else UNKNOWN}")
-        print()
+    
+    def clear_temporary_data(self):
+        with self.lock:
+            self.used = [False] * len(self.tracks)
     
 def _update_metadata(file_path, title, artist, album, track_number, year=None, genre=None, artwork=None):
     """
@@ -372,7 +393,7 @@ def _update_metadata(file_path, title, artist, album, track_number, year=None, g
         
         # DEBUG: print values
     except Exception as e:
-        print(f"{COLOR_ERROR}Failed to update metadata for {file_path}. Error: {e}{COLOR_RESET}")
+        print(f"{COLOR_ERROR}Failed to update metadata for \"{file_path}\". Error: {e}{COLOR_RESET}")
 
 def update_metadata(file_path, album: Album, title: Title):
     """
@@ -430,19 +451,25 @@ def split_audio(file_path, segments, output_folder, format, album):
         segments (list): List of tuples (start_time, segment_name).
         output_folder (str): Folder to save the split audio files.
     """
-    def split_segment(i, start_time, name, params, frame_rate):
+    lock = threading.Lock()
+    def split_segment(i, start_time, name, audio):
         global g_audio_split_worker
+        nonlocal lock, format, album, output_folder
+        params = audio.getparams()
+        frame_rate = params.framerate
+        
         # Determine the start and end frames
         start_frame = int(start_time * frame_rate)
         end_frame = int(segments[i + 1][0] * frame_rate) if i + 1 < len(segments) else params.nframes
 
         # Set the position and read frames
-        audio.setpos(start_frame)
-        frames = audio.readframes(end_frame - start_frame)
+        with lock:
+            audio.setpos(start_frame)
+            frames = audio.readframes(end_frame - start_frame)
 
         # Save the segment with the given name
         title = Title(name)
-        title.fix_title(album, True)
+        title.fix_title(album, False)
         title_str = str(title)
 
         if not g_audio_split_worker.start_task(title_str, i):
@@ -458,23 +485,19 @@ def split_audio(file_path, segments, output_folder, format, album):
         final_file = convert_file(output_path, format)
         g_audio_split_worker.increment(title_str)
         update_metadata(final_file, album, title)
-
         g_audio_split_worker.increment(title_str)
 
     with wave.open(file_path, "rb") as audio:
-        params = audio.getparams()
-        frame_rate = params.framerate
+        threads = []
+        global g_audio_split_worker
+        g_audio_split_worker = Worker(4, len(segments))
+        for i, (start_time, name) in enumerate(segments):
+            thread = threading.Thread(target=split_segment, args=(i, start_time, name, audio))
+            threads.append(thread)
+            thread.start()
 
-    threads = []
-    global g_audio_split_worker
-    g_audio_split_worker = Worker(4, len(segments))
-    for i, (start_time, name) in enumerate(segments):
-        thread = threading.Thread(target=split_segment, args=(i, start_time, name, params, frame_rate))
-        threads.append(thread)
-        thread.start()
-
-    for thread in threads:
-        thread.join()
+        for thread in threads:
+            thread.join()
 
 def get_path_with_format(path, format):
     """
@@ -513,7 +536,7 @@ def convert_file(path, format):
     title = os.path.splitext(os.path.basename(path))[0]
     while os.path.exists(target_path):
         title = increment_or_add_suffix(title)
-        target_path = os.path.join(base, f"{title}.wav")
+        target_path = os.path.join(base, f"{title}.{format}")
 
     # Define the ffmpeg command for conversion
     command = [
@@ -557,12 +580,23 @@ def get_album_info(album_name, artist_name):
     Returns:
         dict: Album information including release date, tracks, and more.
     """
+    def get_list_item_with_highest_count(items, key):
+        if not items:
+            return None
+        return max(items, key=lambda item: item.get(key, 0))
+
     # Set up MusicBrainz client
     musicbrainzngs.set_useragent("AlbumWorks", "1.0", "https://example.com")
 
     try:
         # Search for all releases by name and artist to find the oldest
         result = musicbrainzngs.search_releases(release=album_name, artist=artist_name, limit=100)
+        if not result["release-list"]:
+            return {"not found": "Album not found"}
+    except Exception as e:
+        return {"error": f"An error occurred while getting the album info: {e}"}
+    
+    try:
         if result["release-list"]:
             # Filter releases that match exactly and have dates
             valid_releases = []
@@ -578,27 +612,52 @@ def get_album_info(album_name, artist_name):
             
             # Find the release with the earliest date
             oldest_release = min(valid_releases, key=lambda r: int(r.get("date", "9999-99-99")[:4]))
-            
+            newest_release = max(valid_releases, key=lambda r: int(r.get("date", "0000-00-00")[:4]))
+
+            genre = get_list_item_with_highest_count(newest_release.get("tag-list", []), "count") if "tag-list" in newest_release else None
+            if genre:
+                genre = genre.get("name").title()
+
             album_info = {
-                "name": oldest_release["title"],
-                "artist": oldest_release["artist-credit"][0]["artist"]["name"],
+                "name": newest_release["title"],
+                "artist": newest_release["artist-credit"][0]["artist"]["name"],
                 "release_date": oldest_release.get("date", "Unknown"),
-                "genre": oldest_release.get("genre-list", [{}])[0].get("name") if oldest_release.get("genre-list") else None,
+                "genre": genre,
                 "tracks": [],
-                "url": f"https://musicbrainz.org/release/{oldest_release['id']}"
+                "url": f"https://musicbrainz.org/release/{newest_release['id']}"
             }
 
+            # Try to get genre information from the artist
+            if not album_info["genre"]:
+                try:
+                    artist_id = newest_release["artist-credit"][0]["artist"]["id"]
+                    artist_details = musicbrainzngs.get_artist_by_id(artist_id, includes=["tags"])
+                    if "tag-list" in artist_details["artist"] and artist_details["artist"]["tag-list"]:
+                        # Get the most popular tag as genre
+                        tags = artist_details["artist"]["tag-list"]
+                        genre = get_list_item_with_highest_count(tags, "count")
+                        if genre:
+                            album_info["genre"] = genre.get("name").title()
+                except Exception:
+                    pass  # Keep genre as None if artist lookup fails
+    except Exception as e:
+        return {"error": f"An error occurred while building the album info: {e}"}
+    
+    try:
             # Fetch track information
-            release_id = oldest_release["id"]
+            release_id = newest_release["id"]
             release_details = musicbrainzngs.get_release_by_id(release_id, includes=["recordings"])
             tracks = release_details["release"]["medium-list"][0]["track-list"]
-            album_info["tracks"] = [track["recording"]["title"] for track in tracks]
+            album_info["tracks"] = []
+            for track in tracks:
+                if "title" in track:
+                    album_info["tracks"].append(track["title"])
+                else:
+                    album_info["tracks"].append(track["recording"]["title"])
 
             return album_info
-        else:
-            return {"not found": "Album not found"}
     except Exception as e:
-        return {"error": f"An error occurred: {e}"}
+        return {"error": f"An error occurred while getting the album track info: {e}"}
 
 def search_wikipedia_album_artwork(album_name, artist_name):
     """
@@ -789,10 +848,19 @@ def download_youtube_video(url, output_folder, format, album, i = 0):
         # Get video title and description
         title = yt.title
 
+        # If the song is live, skip it
+        if re.search(r'\(.*[Ll]ive.*\)', title, re.IGNORECASE):
+            g_download_worker.cancel_task(title)
+            return
+
         # Print index and title, if no segments found
         title = Title(yt.title)
         if not segments: # this video is the song
-            title.fix_title(album, False)
+            # If this is the only video being downloaded AND there is only one song in the album, use the album track list to fix the title
+            if g_download_worker.task_count == 1 and album and len(album.tracks) == 1:
+                title.set_title(album.tracks[0], 0)
+            else:
+                title.fix_title(album, False)
         else: # this video has segments (each segment is a song)
             title.fix_title(None, True)
         title_str = str(title)
@@ -886,8 +954,6 @@ def download_youtube_playlist(playlist_url, output_folder, format, album):
         # Wait for all threads to complete
         for thread in threads:
             thread.join()
-
-        print(f"{COLOR_SUCCESS}Playlist downloaded successfully: {playlist.title}{COLOR_RESET}")
 
         return output_folder
     except Exception as e:
@@ -1006,7 +1072,6 @@ def print_line():
     print("-" * os.get_terminal_size().columns)
 
 def main():
-    os.system("cls")
     print("Welcome to the AlbumWorks downloader!")
     print("You can download individual videos or entire playlists.")
     print()
@@ -1036,6 +1101,9 @@ def main():
     album_artist = ""
     album_name = ""
     os.system(f'title AlbumWorks')
+
+    album_info_cache: list[Album] = list()
+    ALBUM_INFO_CACHE_SIZE = 10
     
     while True:
         print_line()
@@ -1058,83 +1126,96 @@ def main():
         else:
             print(f"{COLOR_ERROR}No album name given.{COLOR_RESET}")
             continue
-        album_info = None
-        if len(album_artist) > 0 and len(album_name) > 0:
+
+        album = None
+        for album_info in album_info_cache:
+            if album_info.name.lower() == album_name.lower() and album_info.artist.lower() == album_artist.lower():
+                album = album_info
+                # Clear the album's temporary data
+                album.clear_temporary_data()
+        if album is not None:
+            print(f"{COLOR_INFO}Using cached album information.{COLOR_RESET}")
+            # Move to front of cache
+            album_info_cache.remove(album)
+            album_info_cache.insert(0, album)
+        else:
             print(f"{COLOR_INFO}Retrieving album information...{COLOR_RESET}")
             album_info = get_album_info(album_name, album_artist)
-        album_year = None
-        album_tracks = None
-        manual_entry = album_info is None or "not found" in album_info or "error" in album_info or album_info["artist"] != album_artist
-        if manual_entry:
-            print(f"{COLOR_INFO}Album not found.{COLOR_RESET}")
-            if album_info is not None and "error" in album_info:
-                print(album_info["error"])
-            print("Please enter the rest of the album info manually.")
-            album_year = input("Enter the album year: ").strip()
-            if len(album_year) == 0: album_year = None
-            album_genre = input("Enter the album genre: ").strip()
-            if len(album_genre) == 0: album_genre = None
-            album_tracks = []
-            track_input = 0
-            while True:
-                track_number = input(f"Enter the track number, q to quit, or leave blank for number {track_input + 1}: ").strip()
-                if track_number == "q":
-                    break
-                if len(track_number) != 0:
-                    try:
-                            track_input = int(track_number) - 1
-                    except ValueError:
-                        print(f"{COLOR_ERROR}Invalid track number. Please enter a valid number.{COLOR_RESET}")
-                        continue
-                while len(album_tracks) <= track_input:
-                    album_tracks.append(None)
-                track_name = input(f"Enter the name for track {track_input + 1}: ").strip()
-                album_tracks[track_input] = track_name
-                track_input += 1
-        else:
-            album_year = album_info["release_date"][:4]
-            album_genre = None
-            album_tracks = album_info["tracks"]
-
-        album = Album(album_name, album_artist, album_year, album_genre, album_tracks, None)
-
-        # Print album information
-        album.print()
-
-        # Prompt to override album information
-        overided = False
-        while True:
-            override_choice = input("Enter the name of a value to override if desired. Press Enter to continue: ").strip().lower()
-            if len(override_choice) == 0:
-                break
-            overided = True
-            if override_choice == "artist":
-                album.artist = input("Enter the new artist name: ").strip()
-            elif override_choice == "title":
-                album.name = input("Enter the new album title: ").strip()
-            elif override_choice == "year":
-                album.year = input("Enter the new album year: ").strip()
-            elif override_choice == "genre":
-                album.genre = input("Enter the new album genre: ").strip()
-            elif override_choice == "tracks":
+            album_year = None
+            album_tracks = None
+            manual_entry = album_info is None or "not found" in album_info or "error" in album_info or album_info["artist"] != album_artist
+            if manual_entry:
+                print(f"{COLOR_INFO}Album not found.{COLOR_RESET}")
+                if album_info is not None and "error" in album_info:
+                    print(album_info["error"])
+                print("Please enter the rest of the album info manually.")
+                album_year = input("Enter the album year: ").strip()
+                if len(album_year) == 0: album_year = None
+                album_genre = input("Enter the album genre: ").strip()
+                if len(album_genre) == 0: album_genre = None
+                album_tracks = []
                 while True:
                     track_input = input(f"Enter the index for track to edit, or the name of a new track to add (or leave blank to finish): ").strip()
                     if len(track_input) == 0:
                         break
                     if track_input.isdigit(): # edit existing track
                         track_index = int(track_input) - 1
-                        while len(album.tracks) <= track_index:
-                            album.tracks.append(None)
+                        while len(album_tracks) <= track_index:
+                            album_tracks.append(None)
                         track_name = input(f"Enter the name for track {track_index + 1}: ").strip()
-                        album.tracks[track_index] = track_name
+                        album_tracks[track_index] = track_name
                     else: # add new track
-                        album.tracks.append(track_input)
+                        album_tracks.append(track_input)
             else:
-                print(f"{COLOR_ERROR}Unknown value: {override_choice}{COLOR_RESET}")
+                album_name = album_info["name"]
+                album_artist = album_info["artist"]
+                album_year = album_info["release_date"][:4]
+                album_genre = album_info["genre"]
+                album_tracks = album_info["tracks"]
+            album = Album(album_name, album_artist, album_year, album_genre, album_tracks, None)
+            # Add to cache
+            album_info_cache.insert(0, album)
+            if len(album_info_cache) > ALBUM_INFO_CACHE_SIZE:
+                album_info_cache.pop()
 
-        if overided:
-            print(f"{COLOR_INFO}Updated album information:{COLOR_RESET}")
-            album.print()
+        # Print album information
+        album.print()
+
+        # # Prompt to override album information
+        # overided = False
+        # while True:
+        #     override_choice = input("Enter the name of a value to override if desired. Press Enter to continue: ").strip().lower()
+        #     if len(override_choice) == 0:
+        #         break
+        #     overided = True
+        #     if override_choice == "artist":
+        #         album.artist = input("Enter the new artist name: ").strip()
+        #     elif override_choice == "title":
+        #         album.name = input("Enter the new album title: ").strip()
+        #     elif override_choice == "year":
+        #         album.year = input("Enter the new album year: ").strip()
+        #     elif override_choice == "genre":
+        #         album.genre = input("Enter the new album genre: ").strip()
+        #     elif override_choice == "tracks":
+        #         while True:
+        #             track_input = input(f"Enter the index for track to edit, or the name of a new track to add (or leave blank to finish): ").strip()
+        #             if len(track_input) == 0:
+        #                 break
+        #             if track_input.isdigit(): # edit existing track
+        #                 track_index = int(track_input) - 1
+        #                 while len(album.tracks) <= track_index:
+        #                     album.tracks.append(None)
+        #                 track_name = input(f"Enter the name for track {track_index + 1}: ").strip()
+        #                 album.tracks[track_index] = track_name
+        #             else: # add new track
+        #                 album.tracks.append(track_input)
+        #     else:
+        #         print(f"{COLOR_ERROR}Unknown value: {override_choice}{COLOR_RESET}")
+
+        # if overided:
+        #     print(f"{COLOR_INFO}Updated album information:{COLOR_RESET}")
+        #     album.print()
+        print()
 
         # Prompt for YouTube URL
         url = input("Enter the YouTube video or playlist URL: ").strip()
@@ -1150,24 +1231,15 @@ def main():
             print(f"{COLOR_INFO}Found album artwork on Wikipedia: {wiki_artwork_url}{COLOR_RESET}")
             album_artwork = wiki_artwork_url
             album_artwork_type = ARTWORK_TYPE_LINK
-            album_artwork = input("Enter the path to the album artwork, \"thumbnail\" to use the YouTube thumbnail, or nothing/\"wiki\" for the Wikipedia artwork: ").strip()
-
-            # Prompt for artwork, if user wants to override
-            if len(album_artwork) == 0 or album_artwork.lower() == "wiki":
-                album_artwork = wiki_artwork_url
-                album_artwork_type = ARTWORK_TYPE_LINK
-            elif album_artwork.lower() == "thumbnail":
-                album_artwork_type = ARTWORK_TYPE_THUMBNAIL
-            elif os.path.exists(album_artwork):
-                album_artwork_type = ARTWORK_TYPE_FILE
-            else:
-                album_artwork_type = ARTWORK_TYPE_LINK
         else:
-            print(f"{COLOR_INFO}No artwork found.{COLOR_RESET}")
-            album_artwork = input("Enter the path to the album artwork, or nothing/\"thumbnail\" for the thumbnail: ").strip()
+            print(f"{COLOR_INFO}No artwork found on Wikipedia.{COLOR_RESET}")
+            album_artwork = input("Enter the path to the album artwork, or nothing/\"thumbnail\" to use the YouTube thumbnail: ").strip()
 
             # Prompt for artwork, if user wants to override
             if len(album_artwork) == 0 or album_artwork.lower() == "thumbnail":
+                album_artwork = download_youtube_thumbnail(url, OUTPUT_PATH, THUMBNAIL_NAME)
+                album_artwork_type = ARTWORK_TYPE_THUMBNAIL
+            elif album_artwork.lower() == "thumbnail":
                 album_artwork_type = ARTWORK_TYPE_THUMBNAIL
             elif os.path.exists(album_artwork):
                 album_artwork_type = ARTWORK_TYPE_FILE
@@ -1213,6 +1285,12 @@ def main():
         else:
             print(f"{COLOR_ERROR}Invalid URL. Please provide a valid YouTube video or playlist URL.{COLOR_RESET}")
             continue
+
+        if output_folder is None:
+            print(f"{COLOR_ERROR}Download failed.{COLOR_RESET}")
+        else:
+            print(f"{COLOR_SUCCESS}Download successful.{COLOR_RESET}")
+            print(f"{COLOR_INFO}Files saved to: {output_folder}.{COLOR_RESET}\n")
         
         # Delete thumbnail if it was downloaded
         if album_artwork_temporary and os.path.exists(album_artwork):
@@ -1222,12 +1300,6 @@ def main():
                 print(f"{COLOR_ERROR}Failed to delete thumbnail: {e}{COLOR_RESET}")
         
         # Done
-        print("")
-        print(f"Files saved to: {output_folder}\n")
-        print('Press Enter to run AlbumWorks again or type "exit" to quit.')
-        override_choice = input()
-        if override_choice.lower() == "exit":
-            break
 
 if __name__ == "__main__":
     main()
