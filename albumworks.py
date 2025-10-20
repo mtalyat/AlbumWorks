@@ -26,35 +26,93 @@ COLOR_SUCCESS = "\033[92m"
 COLOR_INFO = "\033[90m"
 COLOR_RESET = "\033[0m"
 
-class ProgressBar:
-    def __init__(self, total, width=50):
-        self.total = total
-        self.current = 0
+class WorkerTask:
+    def __init__(self, priority):
+        self.priority = priority
+        self.progress = 0
+
+    def update(self, progress, weight):
+        self.progress = min(self.progress + progress, weight)
+
+    def set(self, progress):
+        self.progress = progress
+
+class Worker:
+    def __init__(self, task_weight, task_count, width=50):
+        self.total = task_count * task_weight
+        self.task_count = task_count
+        self.task_weight = task_weight
         self.lock = threading.Lock()
+        self.tasks: dict[str, WorkerTask] = dict()
         self.width = width
 
         self.display()
 
-    def update(self, progress):
+    def _check_priority(self, old, new):
+        return old < new
+    
+    def abort_task(self):
+        if self.task_count <= 0:
+            return
         with self.lock:
-            self.current += progress
-            self.display()
+            self.task_count -= 1
+            self.total -= self.task_weight
 
-    def increment(self):
-        self.update(1)
+    def start_task(self, id, priority) -> bool:
+        self.wait_for_task(id)
+        with self.lock:
+            if id in self.tasks:
+                if not self._check_priority(self.tasks[id].priority, priority):
+                    return False
+            self.tasks[id] = WorkerTask(priority)
+            assert len(self.tasks) <= self.task_count
+            return True
+        
+    def cancel_task(self, id):
+        if id is None: return
+        with self.lock:
+            if not id in self.tasks:
+                self.tasks[id] = WorkerTask(0)
+            self.tasks[id].set(self.task_weight)
+        
+    def wait_for_task(self, id):
+        while True:
+            with self.lock:
+                if id not in self.tasks:
+                    return
+                if self.tasks[id].progress >= self.task_weight:
+                    return
+            threading.Event().wait(0.1)
+
+    def update(self, task_id, progress):
+        with self.lock:
+            if task_id not in self.tasks:
+                return
+            self.tasks[task_id].update(progress, self.task_weight)
+        self.display()
+
+    def increment(self, task_id):
+        self.update(task_id, 1)
+
+    def get_total(self):
+        return self.total
+    
+    def get_current(self):
+        with self.lock:
+            return sum(task.progress for task in self.tasks.values())
 
     def display(self):
-        if self.current > self.total:
-            self.current = self.total
-        if self.current == self.total:
+        total = self.get_total()
+        current = self.get_current()
+        if current > total:
+            current = total
+        if current == total:
             print(f"\rProgress: [{'#' * self.width}] 100%")
             return
-        percent = (self.current / self.total * 100) if self.total else 0
+        percent = (current / total * 100) if total else 0
         bar_length = int(self.width * percent / 100)
         bar = "#" * bar_length + "-" * (self.width - bar_length)
         print(f"\rProgress: [{bar}] {percent:.0f}%", end="")
-
-g_progress_bar: ProgressBar = None
 
 def increment_or_add_suffix(string):
     """
@@ -84,17 +142,22 @@ def fix_for_path(path):
     return path.strip()
 
 class Title:
+    display_name: str
+    file_name: str
+    track_index: int
+
     def __init__(self, title):
         self.set_title(title)
     
     def __repr__(self):
-        return self.displayName
+        return self.display_name
     
-    def set_title(self, title):
-        self.displayName = title
-        self.fileName = fix_for_path(title)
+    def set_title(self, title, index = -1):
+        self.display_name = title
+        self.file_name = fix_for_path(title)
+        self.track_index = index
     
-    def fix_title(self, album = None):
+    def fix_title(self, album = None, readonly = True):
         """
         Cleans up the YouTube title by removing unwanted text and illegal characters.
 
@@ -104,7 +167,7 @@ class Title:
         Returns:
             str: The sanitized title.
         """
-        title = self.displayName
+        title = self.display_name
 
         # Remove "(...)" text"
         title = re.sub(r'(\(.*?\))', '', title, flags=re.IGNORECASE)
@@ -149,13 +212,13 @@ class Title:
             title = temp
 
         # If there is a match to a track, use that instead
-        track_index = album.get_track_index(title, False)
+        track_index = album.get_track_index(title, readonly)
         if track_index != -1:
             title = album.tracks[track_index]
 
-        self.set_title(title)
+        self.set_title(title, track_index)
 
-def find_closest_string_index(target: str, string_list):
+def find_closest_string_index(target: str, string_list, used: list[bool]) -> int:
     """
     Finds the index of the closest string in a list to the given target string.
 
@@ -177,11 +240,11 @@ def find_closest_string_index(target: str, string_list):
     #     return string_list.index(closest_match)
     # try matching the first string that starts with the target
     for i, string in enumerate(string_list):
-        if string.startswith(target):
+        if string.startswith(target) and not used[i]:
             return i
     # try the opposite
     for i, string in enumerate(string_list):
-        if string in target:
+        if string in target and not used[i]:
             return i
     # not found
     return -1
@@ -211,8 +274,10 @@ class Album:
         self.artwork = artwork
         self.tracks = tracks if tracks else []
         self.lowered_tracks = [track.lower() for track in tracks] if tracks else []
+        self.used = [False] * len(self.tracks)
+        self.lock = threading.Lock()
 
-    def get_track_index(self, name, addIfNotFound=True):
+    def get_track_index(self, name, readonly: bool):
         """
         Finds the index of a track by its name.
 
@@ -222,14 +287,22 @@ class Album:
         Returns:
             int: The index of the track, or -1 if not found.
         """
-        index = find_closest_string_index(name.lower(), self.lowered_tracks)
-        if index != -1 or not addIfNotFound:
-            # Existing track found
+        with self.lock:
+            index = find_closest_string_index(name.lower(), self.lowered_tracks, self.used)
+        if readonly:
             return index
+        if index != -1:
+            # Existing track found
+            with self.lock:
+                self.used[index] = True
+            return index
+
         # Add new track
-        index = len(self.tracks)
-        self.tracks.append(name)
-        self.lowered_tracks.append(name.lower())
+        with self.lock:
+            index = len(self.tracks)
+            self.used.append(True)
+            self.tracks.append(name)
+            self.lowered_tracks.append(name.lower())
         return index
     
     def get_folder_name(self):
@@ -241,7 +314,7 @@ class Album:
         """
         return fix_for_path(f"{self.artist} - {self.name}")
     
-def update_metadata(file_path, title, artist, album, track_number, year=None, genre=None, artwork=None):
+def _update_metadata(file_path, title, artist, album, track_number, year=None, genre=None, artwork=None):
     """
     Updates the metadata of an MP3 file.
 
@@ -255,6 +328,7 @@ def update_metadata(file_path, title, artist, album, track_number, year=None, ge
         year (str, optional): Release year of the album.
         artwork (str, optional): Path to the album artwork image.
     """
+    
     try:
         # Load the MP3 file
         audio = EasyID3(file_path)
@@ -301,7 +375,7 @@ def update_metadata(file_path, title, artist, album, track_number, year=None, ge
     except Exception as e:
         print(f"{COLOR_ERROR}Failed to update metadata for {file_path}. Error: {e}{COLOR_RESET}")
 
-def update_metadata_with_album(file_path, album):
+def update_metadata(file_path, album: Album, title: Title):
     """
     Updates the metadata of an audio file.
 
@@ -309,16 +383,7 @@ def update_metadata_with_album(file_path, album):
         file_path (str): Path to the audio file.
         album (Album): Album object containing metadata.
     """
-    # Get title from the file name
-    file_name = os.path.splitext(os.path.basename(file_path))[0]
-
-    # Get the track index
-    track_index = album.get_track_index(file_name)
-
-    # Now get the actual track title
-    title = album.tracks[track_index]
-
-    update_metadata(file_path, title, album.artist, album.name, track_index + 1, album.year, album.genre, album.artwork)
+    _update_metadata(file_path, title.display_name, album.artist, album.name, title.track_index + 1, album.year, album.genre, album.artwork)
 
 def parse_timestamps(description):
     """
@@ -367,6 +432,7 @@ def split_audio(file_path, segments, output_folder, format, album):
         output_folder (str): Folder to save the split audio files.
     """
     def split_segment(i, start_time, name, params, frame_rate):
+        global g_audio_split_worker
         # Determine the start and end frames
         start_frame = int(start_time * frame_rate)
         end_frame = int(segments[i + 1][0] * frame_rate) if i + 1 < len(segments) else params.nframes
@@ -377,22 +443,32 @@ def split_audio(file_path, segments, output_folder, format, album):
 
         # Save the segment with the given name
         title = Title(name)
-        title.fix_title(album)
+        title.fix_title(album, True)
+        title_str = str(title)
 
-        output_path = os.path.join(output_folder, f"{title}.wav")
+        if not g_audio_split_worker.start_task(title_str, i):
+            g_audio_split_worker.abort_task()
+            return
+        g_audio_split_worker.increment(title_str)
+
+        output_path = os.path.join(output_folder, f"{title_str}.wav")
         with wave.open(output_path, "wb") as segment:
             segment.setparams(params)
             segment.writeframes(frames)
+        g_audio_split_worker.increment(title_str)
         final_file = convert_file(output_path, format)
-        update_metadata_with_album(final_file, album)
+        g_audio_split_worker.increment(title_str)
+        update_metadata(final_file, album, title)
+
+        g_audio_split_worker.increment(title_str)
 
     with wave.open(file_path, "rb") as audio:
         params = audio.getparams()
         frame_rate = params.framerate
 
     threads = []
-    global g_progress_bar
-    g_progress_bar = ProgressBar(len(segments))
+    global g_audio_split_worker
+    g_audio_split_worker = Worker(4, len(segments))
     for i, (start_time, name) in enumerate(segments):
         thread = threading.Thread(target=split_segment, args=(i, start_time, name, params, frame_rate))
         threads.append(thread)
@@ -400,7 +476,6 @@ def split_audio(file_path, segments, output_folder, format, album):
 
     for thread in threads:
         thread.join()
-        g_progress_bar.increment()
 
 def get_path_with_format(path, format):
     """
@@ -429,14 +504,11 @@ def convert_file(path, format):
     Returns:
         str: Path to the converted file.
     """
-    # Get the base name and current extension of the file
-    _, ext = os.path.splitext(path)
-    current_format = ext[1:]  # Remove the leading dot from the extension
-    # If the file is already in the desired format, return the original path
-    if current_format == format:
-        return path
     # If file already exists in the target format, increment the path
     target_path = get_path_with_format(path, format)
+    # If the file is already in the desired format, return the original path
+    if path == target_path:
+        return path
     # Get the folder path and title from the original path
     base = os.path.dirname(path)
     title = os.path.splitext(os.path.basename(path))[0]
@@ -684,7 +756,7 @@ def search_wikipedia_with_search_api(album_name, artist_name):
     except Exception:
         return None
 
-def download_youtube_video(url, output_folder, format, album):
+def download_youtube_video(url, output_folder, format, album, i = 0):
     """
     Downloads a YouTube video, converts it to WAV, splits it into segments, and saves it in the specified folder.
 
@@ -692,6 +764,7 @@ def download_youtube_video(url, output_folder, format, album):
         url (str): The URL of the YouTube video.
         output_folder (str): The folder where the video and its segments will be saved.
     """
+    global g_download_worker
     try:
         # Create a YouTube object
         yt = YouTube(url)
@@ -705,7 +778,22 @@ def download_youtube_video(url, output_folder, format, album):
 
         # Print index and title, if no segments found
         title = Title(yt.title)
-        title.fix_title(album)
+        if not segments: # this video is the song
+            title.fix_title(album, False)
+        else: # this video has segments (each segment is a song)
+            title.fix_title(None, True)
+        title_str = str(title)
+
+        if not g_download_worker.start_task(title_str, i):
+            g_download_worker.abort_task()
+            return
+        
+        # If song is already downloaded, skip
+        if os.path.exists(os.path.join(output_folder, f'{title.file_name}.{format}')):
+            g_download_worker.cancel_task(title_str)
+            return
+
+        g_download_worker.increment(title_str)
 
         # Get the audio stream
         audio_stream = yt.streams.filter(only_audio=True).first()
@@ -716,8 +804,10 @@ def download_youtube_video(url, output_folder, format, album):
         # Download the audio to the output folder
         downloaded_file = audio_stream.download(output_path=output_folder)
 
+        g_download_worker.increment(title_str)
+
         # Rename to use the safe title
-        file_name = TEMP_NAME if segments else title.fileName
+        file_name = TEMP_NAME if segments else title.file_name
         file_name = os.path.join(output_folder, f"{file_name}.mp4")
 
         # If the file already exists, replace it
@@ -725,14 +815,21 @@ def download_youtube_video(url, output_folder, format, album):
             os.rename(downloaded_file, file_name)
         downloaded_file = file_name
 
-        # if no segments are found, convert to target format and return
+        g_download_worker.increment(title_str)
+        
+        # if no segments are found, convert to target format and return (this is a single song video)
         if not segments:
             final_file = convert_file(downloaded_file, format)
-            update_metadata_with_album(final_file, album)
+            update_metadata(final_file, album, title)
+            g_download_worker.increment(title_str)
             return final_file
+
+        # There are segments, so proceed to split the audio into multiple songs
 
         # Convert the downloaded file to WAV format using ffmpeg so it can be edited
         wav_file = convert_file(downloaded_file, "wav")
+
+        g_download_worker.increment(title_str)
 
         # Create a folder for the video's segments
         os.makedirs(output_folder, exist_ok=True)
@@ -746,6 +843,7 @@ def download_youtube_video(url, output_folder, format, album):
         return output_folder
     except Exception as e:
         print(f"{COLOR_ERROR}An error occurred while processing video: {url}. Error: {e}{COLOR_RESET}")
+        g_download_worker.cancel_task(title_str)
         return None
 
 def download_youtube_playlist(playlist_url, output_folder, format, album):
@@ -763,18 +861,17 @@ def download_youtube_playlist(playlist_url, output_folder, format, album):
         os.makedirs(output_folder, exist_ok=True)
 
         # Iterate through all videos in the playlist
-        global g_progress_bar
-        g_progress_bar = ProgressBar(len(playlist.video_urls))
+        global g_download_worker
+        g_download_worker = Worker(4, len(playlist.video_urls))
         threads = []
-        for video_url in playlist.video_urls:
-            thread = threading.Thread(target=download_youtube_video, args=(video_url, output_folder, format, album))
+        for i, video_url in enumerate(playlist.video_urls):
+            thread = threading.Thread(target=download_youtube_video, args=(video_url, output_folder, format, album, i))
             threads.append(thread)
             thread.start()
         
         # Wait for all threads to complete
         for thread in threads:
             thread.join()
-            g_progress_bar.increment()
 
         print(f"{COLOR_SUCCESS}Playlist downloaded successfully: {playlist.title}{COLOR_RESET}")
 
@@ -918,6 +1015,7 @@ def main():
     if not os.path.exists(base_output_folder):
         print(f"{COLOR_ERROR}Output folder does not exist.{COLOR_RESET}")
         return
+    print(f"{COLOR_INFO}Output folder set to: {base_output_folder}.{COLOR_RESET}")
 
     print()
     
