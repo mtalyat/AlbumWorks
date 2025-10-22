@@ -645,7 +645,8 @@ def get_album_info(album_name, artist_name):
     
     try:
             # Fetch track information
-            release_id = newest_release["id"]
+            largest_release = max(valid_releases, key=lambda r: r.get("track-count", 0))
+            release_id = largest_release["id"]
             release_details = musicbrainzngs.get_release_by_id(release_id, includes=["recordings"])
             tracks = release_details["release"]["medium-list"][0]["track-list"]
             album_info["tracks"] = []
@@ -828,7 +829,7 @@ def search_wikipedia_with_search_api(album_name, artist_name):
     except Exception:
         return None
 
-def download_youtube_video(url, output_folder, format, album, i = 0):
+def download_youtube_video(url, output_folder, format, album, i = 0, limit = None):
     """
     Downloads a YouTube video, converts it to WAV, splits it into segments, and saves it in the specified folder.
 
@@ -845,13 +846,12 @@ def download_youtube_video(url, output_folder, format, album, i = 0):
         description = yt.description
         segments = parse_timestamps(description)
 
+        # Limit the number of segments if specified
+        if limit:
+            segments = segments[:limit]
+
         # Get video title and description
         title = yt.title
-
-        # If the song is live, skip it
-        if re.search(r'\(.*[Ll]ive.*\)', title, re.IGNORECASE):
-            g_download_worker.cancel_task(title)
-            return
 
         # Print index and title, if no segments found
         title = Title(yt.title)
@@ -928,25 +928,29 @@ def download_youtube_video(url, output_folder, format, album, i = 0):
         g_download_worker.cancel_task(title_str)
         return None
 
-def download_youtube_playlist(playlist_url, output_folder, format, album):
+def download_youtube_playlist(playlist_url, output_folder, format, album, song_limit = None):
     """
     Downloads all videos in a YouTube playlist.
 
     Args:
         playlist_url (str): The URL of the YouTube playlist.
     """
-    try:
+    try:        
         # Create a Playlist object
         playlist = Playlist(playlist_url)
+
+        urls = playlist.video_urls
+        if song_limit:
+            urls = urls[:song_limit]
 
         # Create the output folder if it doesn't exist
         os.makedirs(output_folder, exist_ok=True)
 
         # Iterate through all videos in the playlist
         global g_download_worker
-        g_download_worker = Worker(4, len(playlist.video_urls))
+        g_download_worker = Worker(4, len(urls))
         threads = []
-        for i, video_url in enumerate(playlist.video_urls):
+        for i, video_url in enumerate(urls):
             thread = threading.Thread(target=download_youtube_video, args=(video_url, output_folder, format, album, i))
             threads.append(thread)
             thread.start()
@@ -1222,6 +1226,16 @@ def main():
         if len(url) == 0:
             print(f"{COLOR_ERROR}No URL given.{COLOR_RESET}")
             continue
+        url_parts = url.split(" ")
+        url = url_parts[0]
+        if len(url_parts) > 1:
+            try:
+                limit = int(url_parts[1])
+            except ValueError:
+                print(f"{COLOR_ERROR}Invalid limit value: {url_parts[1]}{COLOR_RESET}")
+                continue
+        else:
+            limit = None
 
         # Search for the album artwork
         print(f"{COLOR_INFO}Searching for album artwork...{COLOR_RESET}")
@@ -1273,12 +1287,12 @@ def main():
         album_path = os.path.join(output_folder, album.get_folder_name())
         if "playlist" in url:
             # Process as a playlist
-            output_folder = download_youtube_playlist(url, album_path, format, album)
+            output_folder = download_youtube_playlist(url, album_path, format, album, limit)
         elif "watch" in url:
             # Process as a single video
             global g_download_worker
             g_download_worker = Worker(4, 1)
-            output_folder = download_youtube_video(url, album_path, format, album)
+            output_folder = download_youtube_video(url, album_path, format, album, limit=limit)
             # Get the output folder from the returned file path
             if output_folder is not None and os.path.isfile(output_folder):
                 output_folder = os.path.dirname(output_folder)
