@@ -9,6 +9,9 @@ from pytubefix import YouTube, Playlist
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3, APIC
 import threading
+import concurrent.futures
+import time
+import random
 
 FFMPEG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "ffmpeg", "bin", "ffmpeg.exe")
 OUTPUT_PATH = os.path.join(os.path.expanduser("~"), "Music")
@@ -184,7 +187,7 @@ class Title:
         title = re.sub(r'\|.*$', '', title, flags=re.IGNORECASE)
 
         # If there is a quote block, return that
-        quote_pattern = r'"(.+?)"'
+        quote_pattern = r'[\'"](.+?)[\'"]'
         quote_match = re.search(quote_pattern, title)
         if quote_match:
             title = quote_match.group(1)
@@ -237,16 +240,22 @@ def find_closest_string_index(target: str, string_list, used: list[bool]) -> int
     def _find_closest_string_index(target: str, string_list, used: list[bool]) -> int:
         # try matching the first string that starts with the target
         for i, string in enumerate(string_list):
+            if len(string) == 0:
+                continue
             if string.startswith(target) and not used[i]:
                 return i
         # try the opposite
         for i, string in enumerate(string_list):
+            if len(string) == 0:
+                continue
             if string in target and not used[i]:
                 return i
         # try matching closest string using difflib
         matches = difflib.get_close_matches(target, string_list, n=1, cutoff=0.8)
         if matches:
             closest_match = matches[0]
+            if len(closest_match) == 0:
+                return -1
             i = string_list.index(closest_match)
             if not used[i]:
                 return i
@@ -278,7 +287,7 @@ class Album:
         self.genre = genre
         self.artwork = artwork
         self.tracks = tracks if tracks else []
-        self.lowered_tracks = [track.lower() for track in tracks] if tracks else []
+        self.lowered_tracks = [track.lower() if track else ""for track in tracks] if tracks else []
         self.used = [False] * len(self.tracks)
         self.lock = threading.Lock()
 
@@ -569,7 +578,65 @@ def convert_file(path, format):
 
     return target_path
 
-def get_album_info(album_name, artist_name):
+MUSICBRAINZ_DELAY = 1.1
+MUSICBRAINZ_RETRIES = 3
+
+def musicbrainz_delay():
+    """
+    Introduces a delay to respect MusicBrainz rate limiting.
+    """
+    time.sleep(MUSICBRAINZ_DELAY)
+
+def setup_musicbrainz():
+    """
+    Sets up the MusicBrainz client with user agent and rate limiting.
+    """
+    musicbrainzngs.set_useragent("AlbumWorks", "1.0", "https://github.com/mtalyat/AlbumWorks")
+    musicbrainzngs.set_rate_limit(limit_or_interval=1.0, new_requests=1)
+    musicbrainz_delay()
+
+def safe_musicbrainz_request(request_func, *args, **kwargs):
+    """Wrapper to safely make MusicBrainz requests with retry logic."""
+    for attempt in range(MUSICBRAINZ_RETRIES):
+        try:
+            result = request_func(*args, **kwargs)
+            return result
+        except Exception as e:
+            if attempt < MUSICBRAINZ_RETRIES - 1:
+                # Exponential backoff with jitter
+                delay = MUSICBRAINZ_DELAY * (2 ** attempt) + random.uniform(0, 1)
+                time.sleep(delay)
+            else:
+                raise e
+
+def get_artist_info(artist_name):
+    """
+    Fetches artist information from MusicBrainz.
+
+    Args:
+        artist_name (str): The name of the artist.
+
+    Returns:
+        dict: Artist information including genres and tags.
+    """
+    try:
+        # Search for the artist by name
+        result = safe_musicbrainz_request(musicbrainzngs.search_artists, artist=artist_name, limit=10)
+        if not result["artist-list"]:
+            return {"not found": "Artist not found"}
+        musicbrainz_delay()
+
+        artist_id = result["artist-list"][0]["id"]
+
+        # Fetch artist details including tags
+        artist_details = safe_musicbrainz_request(musicbrainzngs.get_artist_by_id, artist_id, includes=["tags"])
+        musicbrainz_delay()
+
+        return artist_details["artist"]
+    except Exception as e:
+        return {"error": f"An error occurred while getting the artist info: {e}"}
+
+def get_album_info(album_name, artist_info):
     """
     Fetches album information from MusicBrainz.
 
@@ -585,17 +652,16 @@ def get_album_info(album_name, artist_name):
             return None
         return max(items, key=lambda item: item.get(key, 0))
 
-    # Set up MusicBrainz client
-    musicbrainzngs.set_useragent("AlbumWorks", "1.0", "https://example.com")
-
     try:
         # Search for all releases by name and artist to find the oldest
-        result = musicbrainzngs.search_releases(release=album_name, artist=artist_name, limit=100)
+        result = safe_musicbrainz_request(musicbrainzngs.search_releases, release=album_name, artist=artist_name, limit=100)
         if not result["release-list"]:
             return {"not found": "Album not found"}
     except Exception as e:
         return {"error": f"An error occurred while getting the album info: {e}"}
     
+    musicbrainz_delay()
+
     try:
         if result["release-list"]:
             # Filter releases that match exactly and have dates
@@ -630,11 +696,9 @@ def get_album_info(album_name, artist_name):
             # Try to get genre information from the artist
             if not album_info["genre"]:
                 try:
-                    artist_id = newest_release["artist-credit"][0]["artist"]["id"]
-                    artist_details = musicbrainzngs.get_artist_by_id(artist_id, includes=["tags"])
-                    if "tag-list" in artist_details["artist"] and artist_details["artist"]["tag-list"]:
+                    if "tag-list" in artist_info and artist_info["tag-list"]:
                         # Get the most popular tag as genre
-                        tags = artist_details["artist"]["tag-list"]
+                        tags = artist_info["tag-list"]
                         genre = get_list_item_with_highest_count(tags, "count")
                         if genre:
                             album_info["genre"] = genre.get("name").title()
@@ -642,12 +706,14 @@ def get_album_info(album_name, artist_name):
                     pass  # Keep genre as None if artist lookup fails
     except Exception as e:
         return {"error": f"An error occurred while building the album info: {e}"}
-    
+
+    musicbrainz_delay()
+
     try:
             # Fetch track information
-            largest_release = max(valid_releases, key=lambda r: r.get("track-count", 0))
+            largest_release = max(valid_releases, key=lambda r: r.get("track-count", r.get("medium-track-count", 0)))
             release_id = largest_release["id"]
-            release_details = musicbrainzngs.get_release_by_id(release_id, includes=["recordings"])
+            release_details = safe_musicbrainz_request(musicbrainzngs.get_release_by_id, release_id, includes=["recordings"])
             tracks = release_details["release"]["medium-list"][0]["track-list"]
             album_info["tracks"] = []
             for track in tracks:
@@ -829,7 +895,7 @@ def search_wikipedia_with_search_api(album_name, artist_name):
     except Exception:
         return None
 
-def download_youtube_video(url, output_folder, format, album, i = 0, limit = None):
+def download_youtube_video(url, output_folder, format, album, i = 0, limit = None, ignore_segments = False):
     """
     Downloads a YouTube video, converts it to WAV, splits it into segments, and saves it in the specified folder.
 
@@ -844,7 +910,10 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
 
         # Parse timestamps from the description
         description = yt.description
-        segments = parse_timestamps(description)
+        if ignore_segments: # do not parse segments when in a playlist
+            segments = []
+        else:
+            segments = parse_timestamps(description)
 
         # Limit the number of segments if specified
         if limit:
@@ -951,7 +1020,7 @@ def download_youtube_playlist(playlist_url, output_folder, format, album, song_l
         g_download_worker = Worker(4, len(urls))
         threads = []
         for i, video_url in enumerate(urls):
-            thread = threading.Thread(target=download_youtube_video, args=(video_url, output_folder, format, album, i))
+            thread = threading.Thread(target=download_youtube_video, args=(video_url, output_folder, format, album, i, None, True))
             threads.append(thread)
             thread.start()
         
@@ -1107,6 +1176,7 @@ def main():
     os.system(f'title AlbumWorks')
 
     album_info_cache: list[Album] = list()
+    artist_info_cache: list[dict] = list()
     ALBUM_INFO_CACHE_SIZE = 10
     
     while True:
@@ -1122,7 +1192,18 @@ def main():
         else:
             print(f"{COLOR_ERROR}No album artist given.{COLOR_RESET}")
             continue
-        album_name_input = input("Enter the album name: ").strip()
+        # TODO: IF artist info is already cached, use it
+        # Get the artist info from MusicBrainz in the background while user types out the album name
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(get_artist_info, album_artist)
+
+            album_name_input = input("Enter the album name: ").strip()
+
+            artist_info = future.result()
+            if "error" in artist_info or "not found" in artist_info:
+                pass # do nothing, use the input name
+            else:
+                album_artist = artist_info.get("name", album_artist) # replace name in case spelling was off
         if len(album_name_input) > 0:
             album_name = album_name_input
         elif len(album_name) > 0:
@@ -1144,10 +1225,10 @@ def main():
             album_info_cache.insert(0, album)
         else:
             print(f"{COLOR_INFO}Retrieving album information...{COLOR_RESET}")
-            album_info = get_album_info(album_name, album_artist)
+            album_info = get_album_info(album_name, artist_info)
             album_year = None
             album_tracks = None
-            manual_entry = album_info is None or "not found" in album_info or "error" in album_info or album_info["artist"] != album_artist
+            manual_entry = album_info is None or "not found" in album_info or "error" in album_info
             if manual_entry:
                 print(f"{COLOR_INFO}Album not found.{COLOR_RESET}")
                 if album_info is not None and "error" in album_info:
@@ -1165,7 +1246,7 @@ def main():
                     if track_input.isdigit(): # edit existing track
                         track_index = int(track_input) - 1
                         while len(album_tracks) <= track_index:
-                            album_tracks.append(None)
+                            album_tracks.append("")
                         track_name = input(f"Enter the name for track {track_index + 1}: ").strip()
                         album_tracks[track_index] = track_name
                     else: # add new track
@@ -1288,7 +1369,7 @@ def main():
         if "playlist" in url:
             # Process as a playlist
             output_folder = download_youtube_playlist(url, album_path, format, album, limit)
-        elif "watch" in url:
+        elif "youtu" in url:
             # Process as a single video
             global g_download_worker
             g_download_worker = Worker(4, 1)
