@@ -54,9 +54,9 @@ class DownloadResultDisplay:
         with self.lock:
             self.results = []
 
-    def add(self, status, item, detail = None):
+    def add(self, status, item, detail = None, track_number = None):
         with self.lock:
-            self.results.append((status, item, detail))
+            self.results.append((status, item, detail, track_number))
 
     def print_results(self):
         with self.lock:
@@ -65,7 +65,7 @@ class DownloadResultDisplay:
             snapshot = list(self.results)
 
         print()
-        for status, item, detail in snapshot:
+        for status, item, detail, track_number in snapshot:
             color = COLOR_INFO
             if status == RESULT_SUCCESS:
                 color = COLOR_SUCCESS
@@ -79,26 +79,24 @@ class DownloadResultDisplay:
                 suffix = f" -> {detail}" if detail else ""
             else:
                 suffix = ''  # No suffix for success or skipped
-            print(f"{color}[{status}] {item}{suffix}{COLOR_RESET}")
+            track_prefix = f"{track_number}. " if track_number is not None else ""
+            print(f"{color}[{status}] {track_prefix}{item}{suffix}{COLOR_RESET}")
 
     def print_summary(self):
         with self.lock:
             if not self.results:
                 return
-            success = sum(1 for status, _, _ in self.results if status == RESULT_SUCCESS)
-            skipped = sum(1 for status, _, _ in self.results if status == RESULT_SKIPPED)
-            errors = sum(1 for status, _, _ in self.results if status == RESULT_ERROR)
-        total = success + skipped + errors
-        if total == 1:
-            print(f"Result: {'error' if errors > 0 else 'success'}.")
-        else:
+            success = sum(1 for status, _, _, _ in self.results if status == RESULT_SUCCESS)
+            skipped = sum(1 for status, _, _, _ in self.results if status == RESULT_SKIPPED)
+            errors = sum(1 for status, _, _, _ in self.results if status == RESULT_ERROR)
+        if skipped + errors > 0:
             print(f"Results: {success} success, {skipped} skipped, {errors} errors.")
 
 g_result_display = DownloadResultDisplay()
 
-def add_download_result(status, item, detail = None):
+def add_download_result(status, item, detail = None, track_number = None):
     global g_result_display
-    g_result_display.add(status, item, detail)
+    g_result_display.add(status, item, detail, track_number)
 
 class WorkerTask:
     def __init__(self, priority):
@@ -552,7 +550,7 @@ def split_audio(file_path, segments, output_folder, format, album):
 
             if not g_audio_split_worker.start_task(title_str, i):
                 g_audio_split_worker.abort_task()
-                add_download_result(RESULT_SKIPPED, title_str, "Segment was skipped")
+                add_download_result(RESULT_SKIPPED, title_str, "Segment was skipped", i + 1)
                 return
             g_audio_split_worker.increment(title_str)
 
@@ -565,16 +563,16 @@ def split_audio(file_path, segments, output_folder, format, album):
             final_file = convert_file(output_path, format)
             if not final_file:
                 g_audio_split_worker.cancel_task(title_str)
-                add_download_result(RESULT_ERROR, title_str, "Segment conversion failed")
+                add_download_result(RESULT_ERROR, title_str, "Segment conversion failed", i + 1)
                 return
             g_audio_split_worker.increment(title_str)
 
             update_metadata(final_file, album, title)
             g_audio_split_worker.increment(title_str)
-            add_download_result(RESULT_SUCCESS, title_str, final_file)
+            add_download_result(RESULT_SUCCESS, title_str, final_file, i + 1)
         except Exception as e:
             g_audio_split_worker.cancel_task(title_str)
-            add_download_result(RESULT_ERROR, title_str, f"Segment processing failed: {e}")
+            add_download_result(RESULT_ERROR, title_str, f"Segment processing failed: {e}", i + 1)
 
     with wave.open(file_path, "rb") as audio:
         threads = []
@@ -1065,19 +1063,20 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
     """
     global g_download_worker
     title_str = None
+    track_number = i + 1 if i is not None and i >= 0 else None
     try:
         if title_hint:
             hinted_title = Title(title_hint)
             hinted_path = os.path.join(output_folder, f'{hinted_title.file_name}.{format}')
             if os.path.exists(hinted_path):
                 g_download_worker.abort_task()
-                add_download_result(RESULT_SKIPPED, hinted_title.display_name, "File already exists")
+                add_download_result(RESULT_SKIPPED, hinted_title.display_name, "File already exists", track_number)
                 return None
 
         normalized_url = get_video_url(url)
         if not normalized_url:
             print(f"{COLOR_ERROR}Skipping invalid video URL: {url}{COLOR_RESET}")
-            add_download_result(RESULT_SKIPPED, url, "Invalid video URL")
+            add_download_result(RESULT_SKIPPED, url, "Invalid video URL", track_number)
             g_download_worker.abort_task()
             return None
 
@@ -1112,13 +1111,13 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
 
         if not g_download_worker.start_task(title_str, i):
             g_download_worker.abort_task()
-            add_download_result(RESULT_SKIPPED, title_str, "Skipped by priority")
+            add_download_result(RESULT_SKIPPED, title_str, "Skipped by priority", track_number)
             return
         
         # If song is already downloaded, skip
         if os.path.exists(os.path.join(output_folder, f'{title.file_name}.{format}')):
             g_download_worker.cancel_task(title_str)
-            add_download_result(RESULT_SKIPPED, title_str, "File already exists")
+            add_download_result(RESULT_SKIPPED, title_str, "File already exists", track_number)
             return
 
         g_download_worker.increment(title_str)
@@ -1128,7 +1127,7 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
         if not audio_stream:
             print(f"{COLOR_ERROR}No audio stream available for video: {yt.title}{COLOR_RESET}")
             g_download_worker.cancel_task(title_str)
-            add_download_result(RESULT_ERROR, title_str, "No audio stream available")
+            add_download_result(RESULT_ERROR, title_str, "No audio stream available", track_number)
             return
 
         # Download the audio to the output folder
@@ -1136,7 +1135,7 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
         if not downloaded_file or not os.path.exists(downloaded_file):
             print(f"{COLOR_ERROR}Failed to download audio for video: {yt.title}{COLOR_RESET}")
             g_download_worker.cancel_task(title_str)
-            add_download_result(RESULT_ERROR, title_str, "Audio download failed")
+            add_download_result(RESULT_ERROR, title_str, "Audio download failed", track_number)
             return None
 
         g_download_worker.increment(title_str)
@@ -1160,11 +1159,11 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
             if not final_file:
                 print(f"{COLOR_ERROR}Failed to convert audio for video: {yt.title}{COLOR_RESET}")
                 g_download_worker.cancel_task(title_str)
-                add_download_result(RESULT_ERROR, title_str, "Audio conversion failed")
+                add_download_result(RESULT_ERROR, title_str, "Audio conversion failed", track_number)
                 return None
             update_metadata(final_file, album, title)
             g_download_worker.increment(title_str)
-            add_download_result(RESULT_SUCCESS, title_str, final_file)
+            add_download_result(RESULT_SUCCESS, title_str, final_file, track_number)
             return final_file
 
         # There are segments, so proceed to split the audio into multiple songs
@@ -1174,7 +1173,7 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
         if not wav_file:
             print(f"{COLOR_ERROR}Failed to prepare audio segments for video: {yt.title}{COLOR_RESET}")
             g_download_worker.cancel_task(title_str)
-            add_download_result(RESULT_ERROR, title_str, "Failed to prepare split segments")
+            add_download_result(RESULT_ERROR, title_str, "Failed to prepare split segments", track_number)
             return None
 
         g_download_worker.increment(title_str)
@@ -1192,7 +1191,7 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
     except Exception as e:
         print(f"{COLOR_ERROR}An error occurred while processing video: {url}. Error: {e}{COLOR_RESET}")
         g_download_worker.cancel_task(title_str)
-        add_download_result(RESULT_ERROR, title_str if title_str else url, str(e))
+        add_download_result(RESULT_ERROR, title_str if title_str else url, str(e), track_number)
         return None
 
 def download_youtube_playlist(playlist_url, output_folder, format, album, song_limit = None):
@@ -1256,7 +1255,7 @@ def download_youtube_playlist(playlist_url, output_folder, format, album, song_l
                 hinted_path = os.path.join(output_folder, f'{hinted_title.file_name}.{format}')
                 if os.path.exists(hinted_path):
                     g_download_worker.abort_task()
-                    add_download_result(RESULT_SKIPPED, hinted_title.display_name, "File already exists")
+                    add_download_result(RESULT_SKIPPED, hinted_title.display_name, "File already exists", i + 1)
                     continue
 
             thread = threading.Thread(target=download_video_at_index, args=(i, video_url, track_hint))
@@ -1577,6 +1576,66 @@ def main():
         artist_info_cache.insert(0, (key, artist_info))
         if len(artist_info_cache) > ARTIST_INFO_CACHE_SIZE:
             artist_info_cache.pop()
+
+    def prompt_tracks_input(existing_tracks = None):
+        tracks = list(existing_tracks) if existing_tracks else []
+        while True:
+            track_input = input("Enter the index for track to edit, or the name of a new track to add (or leave blank to finish): ").strip()
+            if len(track_input) == 0:
+                break
+            if track_input.isdigit():
+                track_index = int(track_input) - 1
+                while len(tracks) <= track_index:
+                    tracks.append("")
+                track_name = input(f"Enter the name for track {track_index + 1}: ").strip()
+                tracks[track_index] = track_name
+            else:
+                tracks.append(track_input)
+        return tracks
+
+    def prompt_album_edit_or_url(album):
+        while True:
+            entry = input("Enter album attribute to edit, or YouTube URL to continue: ").strip()
+            if len(entry) == 0:
+                return None
+
+            entry_parts = entry.split()
+            url_candidate = entry_parts[0]
+            limit_value = None
+
+            if get_playlist_url(url_candidate) is not None or "youtu" in url_candidate.lower():
+                if len(entry_parts) > 1:
+                    try:
+                        limit_value = int(entry_parts[1])
+                    except ValueError:
+                        print(f"{COLOR_ERROR}Invalid limit value: {entry_parts[1]}{COLOR_RESET}")
+                        continue
+                return (url_candidate, limit_value)
+
+            choice = entry.lower()
+
+            if choice == "artist":
+                album.artist = input("Enter the new artist name: ").strip()
+            elif choice in ["title", "name"]:
+                album.name = input("Enter the new album title: ").strip()
+            elif choice == "year":
+                album.year = input("Enter the new album year (leave blank for unknown): ").strip()
+                if len(album.year) == 0:
+                    album.year = None
+            elif choice == "genre":
+                album.genre = input("Enter the new album genre (leave blank for unknown): ").strip()
+                if len(album.genre) == 0:
+                    album.genre = None
+            elif choice == "tracks":
+                album.tracks = prompt_tracks_input(album.tracks)
+                album.lowered_tracks = [track.lower() if track else "" for track in album.tracks]
+                album.clear_temporary_data()
+            else:
+                print(f"{COLOR_ERROR}Input must be a supported attribute or a YouTube URL.{COLOR_RESET}")
+                continue
+
+            print(f"{COLOR_INFO}Updated album information:{COLOR_RESET}")
+            album.print()
     
     while True:
         print_line()
@@ -1647,19 +1706,7 @@ def main():
                 if len(album_year) == 0: album_year = None
                 album_genre = input("Enter the album genre: ").strip()
                 if len(album_genre) == 0: album_genre = None
-                album_tracks = []
-                while True:
-                    track_input = input(f"Enter the index for track to edit, or the name of a new track to add (or leave blank to finish): ").strip()
-                    if len(track_input) == 0:
-                        break
-                    if track_input.isdigit(): # edit existing track
-                        track_index = int(track_input) - 1
-                        while len(album_tracks) <= track_index:
-                            album_tracks.append("")
-                        track_name = input(f"Enter the name for track {track_index + 1}: ").strip()
-                        album_tracks[track_index] = track_name
-                    else: # add new track
-                        album_tracks.append(track_input)
+                album_tracks = prompt_tracks_input([])
             else:
                 album_name = album_info["name"]
                 album_artist = album_info["artist"]
@@ -1674,59 +1721,19 @@ def main():
 
         # Print album information
         album.print()
+        edit_or_url = prompt_album_edit_or_url(album)
+        if edit_or_url is None:
+            print(f"{COLOR_INFO}Input cancelled.{COLOR_RESET}")
+            continue
 
-        # # Prompt to override album information
-        # overided = False
-        # while True:
-        #     override_choice = input("Enter the name of a value to override if desired. Press Enter to continue: ").strip().lower()
-        #     if len(override_choice) == 0:
-        #         break
-        #     overided = True
-        #     if override_choice == "artist":
-        #         album.artist = input("Enter the new artist name: ").strip()
-        #     elif override_choice == "title":
-        #         album.name = input("Enter the new album title: ").strip()
-        #     elif override_choice == "year":
-        #         album.year = input("Enter the new album year: ").strip()
-        #     elif override_choice == "genre":
-        #         album.genre = input("Enter the new album genre: ").strip()
-        #     elif override_choice == "tracks":
-        #         while True:
-        #             track_input = input(f"Enter the index for track to edit, or the name of a new track to add (or leave blank to finish): ").strip()
-        #             if len(track_input) == 0:
-        #                 break
-        #             if track_input.isdigit(): # edit existing track
-        #                 track_index = int(track_input) - 1
-        #                 while len(album.tracks) <= track_index:
-        #                     album.tracks.append(None)
-        #                 track_name = input(f"Enter the name for track {track_index + 1}: ").strip()
-        #                 album.tracks[track_index] = track_name
-        #             else: # add new track
-        #                 album.tracks.append(track_input)
-        #     else:
-        #         print(f"{COLOR_ERROR}Unknown value: {override_choice}{COLOR_RESET}")
+        url, limit = edit_or_url
 
-        # if overided:
-        #     print(f"{COLOR_INFO}Updated album information:{COLOR_RESET}")
-        #     album.print()
+        # Keep local album values aligned with any manual edits.
+        album_name = album.name
+        album_artist = album.artist
         print()
 
-        # Prompt for YouTube URL
         g_result_display.reset()
-        url = input("Enter the YouTube video or playlist URL: ").strip()
-        if len(url) == 0:
-            print(f"{COLOR_ERROR}No URL given.{COLOR_RESET}")
-            continue
-        url_parts = url.split(" ")
-        url = url_parts[0]
-        if len(url_parts) > 1:
-            try:
-                limit = int(url_parts[1])
-            except ValueError:
-                print(f"{COLOR_ERROR}Invalid limit value: {url_parts[1]}{COLOR_RESET}")
-                continue
-        else:
-            limit = None
 
         # Search for the album artwork
         print(f"{COLOR_INFO}Searching for album artwork...{COLOR_RESET}")
