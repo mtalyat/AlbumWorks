@@ -911,8 +911,13 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
     global g_download_worker
     title_str = None
     try:
+        normalized_url = get_video_url(url)
+        if not normalized_url:
+            print(f"{COLOR_ERROR}Skipping invalid video URL: {url}{COLOR_RESET}")
+            return None
+
         # Create a YouTube object
-        yt = YouTube(url)
+        yt = YouTube(normalized_url)
 
         # Parse timestamps from the description
         description = yt.description
@@ -1038,6 +1043,18 @@ def download_youtube_playlist(playlist_url, output_folder, format, album, song_l
                 pass
         if not urls:
             urls = extract_playlist_video_urls(playlist_url)
+
+        # Normalize to valid watch URLs and drop non-video links (e.g. search URLs).
+        normalized_urls = []
+        seen_urls = set()
+        for candidate_url in urls:
+            normalized_url = get_video_url(candidate_url)
+            if not normalized_url or normalized_url in seen_urls:
+                continue
+            seen_urls.add(normalized_url)
+            normalized_urls.append(normalized_url)
+        urls = normalized_urls
+
         if song_limit:
             urls = urls[:song_limit]
 
@@ -1207,6 +1224,37 @@ def get_playlist_url(url):
             return f"https://www.youtube.com/playlist?list={list_ids[0]}"
     except Exception:
         pass
+    return None
+
+def get_video_url(url):
+    """
+    Returns a normalized YouTube watch URL when a valid 11-character video ID
+    can be extracted from the input URL, otherwise None.
+    """
+    try:
+        parsed = urlparse(url)
+
+        # Standard watch URL: ?v=<id>
+        query = parse_qs(parsed.query)
+        if "v" in query and len(query["v"]) > 0:
+            candidate = query["v"][0]
+            if re.fullmatch(r"[0-9A-Za-z_-]{11}", candidate):
+                return f"https://www.youtube.com/watch?v={candidate}"
+
+        # Short URL: youtu.be/<id>
+        path = parsed.path.strip("/")
+        if parsed.netloc.lower().endswith("youtu.be") and len(path) > 0:
+            candidate = path.split("/")[0]
+            if re.fullmatch(r"[0-9A-Za-z_-]{11}", candidate):
+                return f"https://www.youtube.com/watch?v={candidate}"
+
+        # Generic fallback: extract any embedded 11-char video id from URL
+        match = re.search(r"(?:v=|/)([0-9A-Za-z_-]{11})(?:[?&/]|$)", url)
+        if match:
+            return f"https://www.youtube.com/watch?v={match.group(1)}"
+    except Exception:
+        pass
+
     return None
 
 def extract_playlist_video_urls(playlist_url):
