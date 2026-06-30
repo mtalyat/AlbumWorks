@@ -12,6 +12,7 @@ import threading
 import concurrent.futures
 import time
 import random
+from urllib.parse import parse_qs, urlparse
 
 APP_NAME = "AlbumWorks"
 APP_VERSION = "1.0.4"
@@ -908,6 +909,7 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
         output_folder (str): The folder where the video and its segments will be saved.
     """
     global g_download_worker
+    title_str = None
     try:
         # Create a YouTube object
         yt = YouTube(url)
@@ -958,6 +960,10 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
 
         # Download the audio to the output folder
         downloaded_file = audio_stream.download(output_path=output_folder)
+        if not downloaded_file or not os.path.exists(downloaded_file):
+            print(f"{COLOR_ERROR}Failed to download audio for video: {yt.title}{COLOR_RESET}")
+            g_download_worker.cancel_task(title_str)
+            return None
 
         g_download_worker.increment(title_str)
 
@@ -965,9 +971,11 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
         file_name = TEMP_NAME if segments else title.file_name
         file_name = os.path.join(output_folder, f"{file_name}.mp4")
 
-        # If the file already exists, replace it
-        if not os.path.exists(file_name):
-            os.rename(downloaded_file, file_name)
+        # Normalize temporary name so conversion always targets a known path.
+        if os.path.abspath(downloaded_file) != os.path.abspath(file_name):
+            if os.path.exists(file_name):
+                os.remove(file_name)
+            os.replace(downloaded_file, file_name)
         downloaded_file = file_name
 
         g_download_worker.increment(title_str)
@@ -975,6 +983,10 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
         # if no segments are found, convert to target format and return (this is a single song video)
         if not segments:
             final_file = convert_file(downloaded_file, format)
+            if not final_file:
+                print(f"{COLOR_ERROR}Failed to convert audio for video: {yt.title}{COLOR_RESET}")
+                g_download_worker.cancel_task(title_str)
+                return None
             update_metadata(final_file, album, title)
             g_download_worker.increment(title_str)
             return final_file
@@ -983,6 +995,10 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
 
         # Convert the downloaded file to WAV format using ffmpeg so it can be edited
         wav_file = convert_file(downloaded_file, "wav")
+        if not wav_file:
+            print(f"{COLOR_ERROR}Failed to prepare audio segments for video: {yt.title}{COLOR_RESET}")
+            g_download_worker.cancel_task(title_str)
+            return None
 
         g_download_worker.increment(title_str)
 
@@ -1009,12 +1025,25 @@ def download_youtube_playlist(playlist_url, output_folder, format, album, song_l
         playlist_url (str): The URL of the YouTube playlist.
     """
     try:        
+        playlist_url = get_playlist_url(playlist_url) or playlist_url
+
         # Create a Playlist object
         playlist = Playlist(playlist_url)
 
         urls = playlist.video_urls
+        if not urls:
+            try:
+                urls = [video.watch_url for video in playlist.videos if hasattr(video, "watch_url")]
+            except Exception:
+                pass
+        if not urls:
+            urls = extract_playlist_video_urls(playlist_url)
         if song_limit:
             urls = urls[:song_limit]
+
+        if not urls:
+            print(f"{COLOR_ERROR}No videos found in playlist: {playlist_url}{COLOR_RESET}")
+            return None
 
         # Create the output folder if it doesn't exist
         os.makedirs(output_folder, exist_ok=True)
@@ -1023,14 +1052,23 @@ def download_youtube_playlist(playlist_url, output_folder, format, album, song_l
         global g_download_worker
         g_download_worker = Worker(4, len(urls))
         threads = []
+        results = [None] * len(urls)
+
+        def download_video_at_index(index, video_url):
+            results[index] = download_youtube_video(video_url, output_folder, format, album, index, None, True)
+
         for i, video_url in enumerate(urls):
-            thread = threading.Thread(target=download_youtube_video, args=(video_url, output_folder, format, album, i, None, True))
+            thread = threading.Thread(target=download_video_at_index, args=(i, video_url))
             threads.append(thread)
             thread.start()
         
         # Wait for all threads to complete
         for thread in threads:
             thread.join()
+
+        if not any(result is not None for result in results):
+            print(f"{COLOR_ERROR}Failed to download any tracks from the playlist.{COLOR_RESET}")
+            return None
 
         return output_folder
     except Exception as e:
@@ -1052,13 +1090,22 @@ def download_youtube_thumbnail(url, output_folder, name):
         # Ensure the output folder exists
         os.makedirs(output_folder, exist_ok=True)
 
-        # Check if the URL is a playlist
-        if "playlist" in url:
+        # Check if the URL contains playlist information
+        playlist_url = get_playlist_url(url)
+        if playlist_url is not None:
             # Handle playlist: use the first video's thumbnail
-            playlist = Playlist(url)
-            if not playlist.video_urls:
+            playlist = Playlist(playlist_url)
+            playlist_video_urls = playlist.video_urls
+            if not playlist_video_urls:
+                try:
+                    playlist_video_urls = [video.watch_url for video in playlist.videos if hasattr(video, "watch_url")]
+                except Exception:
+                    playlist_video_urls = []
+            if not playlist_video_urls:
+                playlist_video_urls = extract_playlist_video_urls(playlist_url)
+            if not playlist_video_urls:
                 return None
-            video_url = playlist.video_urls[0]  # Use the first video in the playlist
+            video_url = playlist_video_urls[0]  # Use the first video in the playlist
         else:
             # Handle single video
             video_url = url
@@ -1147,6 +1194,47 @@ def open_directory(path):
 
 def print_line():
     print("-" * os.get_terminal_size().columns)
+
+def get_playlist_url(url):
+    """
+    Returns a normalized YouTube playlist URL when one is present, otherwise None.
+    """
+    try:
+        parsed = urlparse(url)
+        query = parse_qs(parsed.query)
+        list_ids = query.get("list", [])
+        if list_ids and len(list_ids[0]) > 0:
+            return f"https://www.youtube.com/playlist?list={list_ids[0]}"
+    except Exception:
+        pass
+    return None
+
+def extract_playlist_video_urls(playlist_url):
+    """
+    Extracts video watch URLs from a playlist page as a fallback when pytubefix
+    fails to populate Playlist.video_urls (common with some OLAK playlists).
+    """
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0"
+        }
+        response = requests.get(playlist_url, headers=headers, timeout=20)
+        if response.status_code != 200:
+            return []
+
+        video_ids = re.findall(r'"videoId":"([A-Za-z0-9_-]{11})"', response.text)
+
+        unique_ids = []
+        seen = set()
+        for video_id in video_ids:
+            if video_id in seen:
+                continue
+            seen.add(video_id)
+            unique_ids.append(video_id)
+
+        return [f"https://www.youtube.com/watch?v={video_id}" for video_id in unique_ids]
+    except Exception:
+        return []
 
 def main():
     print("Welcome to the AlbumWorks downloader!")
@@ -1407,11 +1495,14 @@ def main():
         album.artwork = album_artwork
 
         album_path = os.path.join(output_folder, album.get_folder_name())
-        if "playlist" in url:
+        playlist_url = get_playlist_url(url)
+        if playlist_url is not None:
             # Process as a playlist
-            output_folder = download_youtube_playlist(url, album_path, format, album, limit)
+            print(f"{COLOR_INFO}Processing playlist...{COLOR_RESET}")
+            output_folder = download_youtube_playlist(playlist_url, album_path, format, album, limit)
         elif "youtu" in url:
             # Process as a single video
+            print(f"{COLOR_INFO}Processing video...{COLOR_RESET}")
             global g_download_worker
             g_download_worker = Worker(4, 1)
             output_folder = download_youtube_video(url, album_path, format, album, limit=limit)
