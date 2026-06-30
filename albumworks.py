@@ -24,6 +24,9 @@ FORMATS = ["mp3", "wav", "mp4a"]
 TEMP_NAME = "temp"
 THUMBNAIL_NAME = "thumbnail"
 UNKNOWN = "Unknown"
+TRIM_SILENCE = True
+TRIM_SILENCE_THRESHOLD = "-50dB"
+TRIM_SILENCE_MIN_DURATION = "0.25"
 
 ARTWORK_TYPES = ['file', 'url', 'thumbnail']
 ARTWORK_TYPE_FILE = 0 # file on disk
@@ -529,13 +532,14 @@ def get_path_with_format(path, format):
         format = format[1:]  # Remove leading dot if present
     return f"{base}.{format}"
 
-def convert_file(path, format):
+def convert_file(path, format, trim_silence = TRIM_SILENCE):
     """
     Converts a file to the specified format.
 
     Args:
         path (str): Path to the file to convert.
         format (str): Desired output format (e.g., 'mp3', 'wav', 'mp4a').
+        trim_silence (bool): Whether to trim silence at the start and end.
 
     Returns:
         str: Path to the converted file.
@@ -559,6 +563,13 @@ def convert_file(path, format):
         "-vn",  # No video
     ]
 
+    if trim_silence:
+        # Trim only edge silence (front/back) while keeping interior pauses.
+        command += [
+            "-af",
+            f"silenceremove=start_periods=1:start_duration={TRIM_SILENCE_MIN_DURATION}:start_threshold={TRIM_SILENCE_THRESHOLD},areverse,silenceremove=start_periods=1:start_duration={TRIM_SILENCE_MIN_DURATION}:start_threshold={TRIM_SILENCE_THRESHOLD},areverse"
+        ]
+
     # Add format-specific options
     if format == "mp3":
         command += ["-ar", "44100", "-ac", "2", "-b:a", "192k"]  # MP3 options
@@ -578,6 +589,31 @@ def convert_file(path, format):
             subprocess.run(command, check=True, stdout=devnull, stderr=devnull)
         os.remove(path)  # Optionally remove the original file after conversion
     except Exception as e:
+        if trim_silence:
+            # Some files can fail silence filters; retry conversion without trimming.
+            retry_command = [
+                FFMPEG_PATH,
+                "-i", path,
+                "-vn",
+            ]
+
+            if format == "mp3":
+                retry_command += ["-ar", "44100", "-ac", "2", "-b:a", "192k"]
+            elif format == "wav":
+                retry_command += ["-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2"]
+            elif format == "mp4a":
+                retry_command += ["-c:a", "aac", "-b:a", "192k"]
+
+            retry_command.append(target_path)
+            try:
+                with open(os.devnull, 'wb') as devnull:
+                    subprocess.run(retry_command, check=True, stdout=devnull, stderr=devnull)
+                os.remove(path)
+                return target_path
+            except Exception as retry_error:
+                print(f"{COLOR_ERROR}Failed to convert {path} to {format}. Error: {retry_error}{COLOR_RESET}")
+                return None
+
         print(f"{COLOR_ERROR}Failed to convert {path} to {format}. Error: {e}{COLOR_RESET}")
         return None
 
@@ -999,7 +1035,7 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
         # There are segments, so proceed to split the audio into multiple songs
 
         # Convert the downloaded file to WAV format using ffmpeg so it can be edited
-        wav_file = convert_file(downloaded_file, "wav")
+        wav_file = convert_file(downloaded_file, "wav", trim_silence=False)
         if not wav_file:
             print(f"{COLOR_ERROR}Failed to prepare audio segments for video: {yt.title}{COLOR_RESET}")
             g_download_worker.cancel_task(title_str)
