@@ -27,6 +27,9 @@ UNKNOWN = "Unknown"
 TRIM_SILENCE = True
 TRIM_SILENCE_THRESHOLD = "-50dB"
 TRIM_SILENCE_MIN_DURATION = "0.25"
+YT_PO_TOKEN_ENV = "ALBUMWORKS_YT_PO_TOKEN"
+YT_VISITOR_DATA_ENV = "ALBUMWORKS_YT_VISITOR_DATA"
+YOUTUBE_REQUEST_SPACING_SECONDS = 0.5
 
 ARTWORK_TYPES = ['file', 'url', 'thumbnail']
 ARTWORK_TYPE_FILE = 0 # file on disk
@@ -37,6 +40,65 @@ COLOR_ERROR = "\033[91m"
 COLOR_SUCCESS = "\033[92m"
 COLOR_INFO = "\033[90m"
 COLOR_RESET = "\033[0m"
+
+RESULT_SUCCESS = "SUCCESS"
+RESULT_SKIPPED = "SKIPPED"
+RESULT_ERROR = "ERROR"
+
+class DownloadResultDisplay:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.results = []
+
+    def reset(self):
+        with self.lock:
+            self.results = []
+
+    def add(self, status, item, detail = None):
+        with self.lock:
+            self.results.append((status, item, detail))
+
+    def print_results(self):
+        with self.lock:
+            if not self.results:
+                return
+            snapshot = list(self.results)
+
+        print()
+        for status, item, detail in snapshot:
+            color = COLOR_INFO
+            if status == RESULT_SUCCESS:
+                color = COLOR_SUCCESS
+            elif status == RESULT_ERROR:
+                color = COLOR_ERROR
+            
+            # If succeeded, it has been written to a file
+            # If skipped, the file already exists
+            # If failed, we will want to know why
+            if status == RESULT_ERROR:
+                suffix = f" -> {detail}" if detail else ""
+            else:
+                suffix = ''  # No suffix for success or skipped
+            print(f"{color}[{status}] {item}{suffix}{COLOR_RESET}")
+
+    def print_summary(self):
+        with self.lock:
+            if not self.results:
+                return
+            success = sum(1 for status, _, _ in self.results if status == RESULT_SUCCESS)
+            skipped = sum(1 for status, _, _ in self.results if status == RESULT_SKIPPED)
+            errors = sum(1 for status, _, _ in self.results if status == RESULT_ERROR)
+        total = success + skipped + errors
+        if total == 1:
+            print(f"Result: {'error' if errors > 0 else 'success'}.")
+        else:
+            print(f"Results: {success} success, {skipped} skipped, {errors} errors.")
+
+g_result_display = DownloadResultDisplay()
+
+def add_download_result(status, item, detail = None):
+    global g_result_display
+    g_result_display.add(status, item, detail)
 
 class WorkerTask:
     def __init__(self, priority):
@@ -472,37 +534,47 @@ def split_audio(file_path, segments, output_folder, format, album):
     def split_segment(i, start_time, name, audio):
         global g_audio_split_worker
         nonlocal lock, format, album, output_folder
-        params = audio.getparams()
-        frame_rate = params.framerate
-        
-        # Determine the start and end frames
-        start_frame = int(start_time * frame_rate)
-        end_frame = int(segments[i + 1][0] * frame_rate) if i + 1 < len(segments) else params.nframes
-
-        # Set the position and read frames
-        with lock:
-            audio.setpos(start_frame)
-            frames = audio.readframes(end_frame - start_frame)
-
-        # Save the segment with the given name
         title = Title(name)
         title.fix_title(album, False)
         title_str = str(title)
+        try:
+            params = audio.getparams()
+            frame_rate = params.framerate
 
-        if not g_audio_split_worker.start_task(title_str, i):
-            g_audio_split_worker.abort_task()
-            return
-        g_audio_split_worker.increment(title_str)
+            # Determine the start and end frames
+            start_frame = int(start_time * frame_rate)
+            end_frame = int(segments[i + 1][0] * frame_rate) if i + 1 < len(segments) else params.nframes
 
-        output_path = os.path.join(output_folder, f"{title_str}.wav")
-        with wave.open(output_path, "wb") as segment:
-            segment.setparams(params)
-            segment.writeframes(frames)
-        g_audio_split_worker.increment(title_str)
-        final_file = convert_file(output_path, format)
-        g_audio_split_worker.increment(title_str)
-        update_metadata(final_file, album, title)
-        g_audio_split_worker.increment(title_str)
+            # Set the position and read frames
+            with lock:
+                audio.setpos(start_frame)
+                frames = audio.readframes(end_frame - start_frame)
+
+            if not g_audio_split_worker.start_task(title_str, i):
+                g_audio_split_worker.abort_task()
+                add_download_result(RESULT_SKIPPED, title_str, "Segment was skipped")
+                return
+            g_audio_split_worker.increment(title_str)
+
+            output_path = os.path.join(output_folder, f"{title_str}.wav")
+            with wave.open(output_path, "wb") as segment:
+                segment.setparams(params)
+                segment.writeframes(frames)
+            g_audio_split_worker.increment(title_str)
+
+            final_file = convert_file(output_path, format)
+            if not final_file:
+                g_audio_split_worker.cancel_task(title_str)
+                add_download_result(RESULT_ERROR, title_str, "Segment conversion failed")
+                return
+            g_audio_split_worker.increment(title_str)
+
+            update_metadata(final_file, album, title)
+            g_audio_split_worker.increment(title_str)
+            add_download_result(RESULT_SUCCESS, title_str, final_file)
+        except Exception as e:
+            g_audio_split_worker.cancel_task(title_str)
+            add_download_result(RESULT_ERROR, title_str, f"Segment processing failed: {e}")
 
     with wave.open(file_path, "rb") as audio:
         threads = []
@@ -693,6 +765,24 @@ def get_album_info(album_name, artist_info):
             return None
         return max(items, key=lambda item: item.get(key, 0))
 
+    def is_commentary_track(track_name):
+        if not track_name:
+            return False
+        return re.search(r"\bcommentary\b", track_name, re.IGNORECASE) is not None
+
+    def get_release_tracks(release_details):
+        tracks = []
+        for medium in release_details["release"].get("medium-list", []):
+            for track in medium.get("track-list", []):
+                if "title" in track:
+                    tracks.append(track["title"])
+                else:
+                    tracks.append(track["recording"]["title"])
+        return tracks
+
+    valid_releases = []
+    album_info = None
+
     try:
         # Search for all releases by name and artist to find the oldest
         result = safe_musicbrainz_request(musicbrainzngs.search_releases, release=album_name, artist=artist_info["name"], limit=100)
@@ -751,17 +841,46 @@ def get_album_info(album_name, artist_info):
     musicbrainz_delay()
 
     try:
-            # Fetch track information
-            largest_release = max(valid_releases, key=lambda r: r.get("track-count", r.get("medium-track-count", 0)))
-            release_id = largest_release["id"]
-            release_details = safe_musicbrainz_request(musicbrainzngs.get_release_by_id, release_id, includes=["recordings"])
-            tracks = release_details["release"]["medium-list"][0]["track-list"]
-            album_info["tracks"] = []
-            for track in tracks:
-                if "title" in track:
-                    album_info["tracks"].append(track["title"])
-                else:
-                    album_info["tracks"].append(track["recording"]["title"])
+            if not valid_releases or album_info is None:
+                return {"not found": "Album not found"}
+
+            # Fetch track information from the best non-commentary release.
+            candidate_releases = sorted(
+                valid_releases,
+                key=lambda r: r.get("track-count", r.get("medium-track-count", 0)),
+                reverse=True
+            )
+
+            selected_release_id = None
+            selected_tracks = None
+
+            for candidate_release in candidate_releases:
+                release_id = candidate_release["id"]
+                release_details = safe_musicbrainz_request(musicbrainzngs.get_release_by_id, release_id, includes=["recordings"])
+                musicbrainz_delay()
+
+                candidate_tracks = get_release_tracks(release_details)
+                if not candidate_tracks:
+                    continue
+
+                commentary_count = sum(1 for track in candidate_tracks if is_commentary_track(track))
+                if commentary_count == len(candidate_tracks):
+                    print(f"{COLOR_INFO}Skipping commentary release: {release_id}.{COLOR_RESET}")
+                    continue
+
+                selected_release_id = release_id
+                selected_tracks = candidate_tracks
+                break
+
+            if not selected_tracks:
+                # If all candidates look like commentary releases, fall back to the top candidate.
+                fallback_release = candidate_releases[0]
+                selected_release_id = fallback_release["id"]
+                release_details = safe_musicbrainz_request(musicbrainzngs.get_release_by_id, selected_release_id, includes=["recordings"])
+                selected_tracks = get_release_tracks(release_details)
+
+            album_info["tracks"] = selected_tracks
+            album_info["url"] = f"https://musicbrainz.org/release/{selected_release_id}"
 
             return album_info
     except Exception as e:
@@ -936,7 +1055,7 @@ def search_wikipedia_with_search_api(album_name, artist_name):
     except Exception:
         return None
 
-def download_youtube_video(url, output_folder, format, album, i = 0, limit = None, ignore_segments = False):
+def download_youtube_video(url, output_folder, format, album, i = 0, limit = None, ignore_segments = False, title_hint = None):
     """
     Downloads a YouTube video, converts it to WAV, splits it into segments, and saves it in the specified folder.
 
@@ -947,13 +1066,23 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
     global g_download_worker
     title_str = None
     try:
+        if title_hint:
+            hinted_title = Title(title_hint)
+            hinted_path = os.path.join(output_folder, f'{hinted_title.file_name}.{format}')
+            if os.path.exists(hinted_path):
+                g_download_worker.abort_task()
+                add_download_result(RESULT_SKIPPED, hinted_title.display_name, "File already exists")
+                return None
+
         normalized_url = get_video_url(url)
         if not normalized_url:
             print(f"{COLOR_ERROR}Skipping invalid video URL: {url}{COLOR_RESET}")
+            add_download_result(RESULT_SKIPPED, url, "Invalid video URL")
+            g_download_worker.abort_task()
             return None
 
         # Create a YouTube object
-        yt = YouTube(normalized_url)
+        yt = create_youtube_client(normalized_url)
 
         # Parse timestamps from the description
         description = yt.description
@@ -983,11 +1112,13 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
 
         if not g_download_worker.start_task(title_str, i):
             g_download_worker.abort_task()
+            add_download_result(RESULT_SKIPPED, title_str, "Skipped by priority")
             return
         
         # If song is already downloaded, skip
         if os.path.exists(os.path.join(output_folder, f'{title.file_name}.{format}')):
             g_download_worker.cancel_task(title_str)
+            add_download_result(RESULT_SKIPPED, title_str, "File already exists")
             return
 
         g_download_worker.increment(title_str)
@@ -997,6 +1128,7 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
         if not audio_stream:
             print(f"{COLOR_ERROR}No audio stream available for video: {yt.title}{COLOR_RESET}")
             g_download_worker.cancel_task(title_str)
+            add_download_result(RESULT_ERROR, title_str, "No audio stream available")
             return
 
         # Download the audio to the output folder
@@ -1004,6 +1136,7 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
         if not downloaded_file or not os.path.exists(downloaded_file):
             print(f"{COLOR_ERROR}Failed to download audio for video: {yt.title}{COLOR_RESET}")
             g_download_worker.cancel_task(title_str)
+            add_download_result(RESULT_ERROR, title_str, "Audio download failed")
             return None
 
         g_download_worker.increment(title_str)
@@ -1027,9 +1160,11 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
             if not final_file:
                 print(f"{COLOR_ERROR}Failed to convert audio for video: {yt.title}{COLOR_RESET}")
                 g_download_worker.cancel_task(title_str)
+                add_download_result(RESULT_ERROR, title_str, "Audio conversion failed")
                 return None
             update_metadata(final_file, album, title)
             g_download_worker.increment(title_str)
+            add_download_result(RESULT_SUCCESS, title_str, final_file)
             return final_file
 
         # There are segments, so proceed to split the audio into multiple songs
@@ -1039,6 +1174,7 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
         if not wav_file:
             print(f"{COLOR_ERROR}Failed to prepare audio segments for video: {yt.title}{COLOR_RESET}")
             g_download_worker.cancel_task(title_str)
+            add_download_result(RESULT_ERROR, title_str, "Failed to prepare split segments")
             return None
 
         g_download_worker.increment(title_str)
@@ -1056,6 +1192,7 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
     except Exception as e:
         print(f"{COLOR_ERROR}An error occurred while processing video: {url}. Error: {e}{COLOR_RESET}")
         g_download_worker.cancel_task(title_str)
+        add_download_result(RESULT_ERROR, title_str if title_str else url, str(e))
         return None
 
 def download_youtube_playlist(playlist_url, output_folder, format, album, song_limit = None):
@@ -1107,21 +1244,31 @@ def download_youtube_playlist(playlist_url, output_folder, format, album, song_l
         threads = []
         results = [None] * len(urls)
 
-        def download_video_at_index(index, video_url):
-            results[index] = download_youtube_video(video_url, output_folder, format, album, index, None, True)
+        def download_video_at_index(index, video_url, track_hint):
+            results[index] = download_youtube_video(video_url, output_folder, format, album, index, None, True, track_hint)
 
         for i, video_url in enumerate(urls):
-            thread = threading.Thread(target=download_video_at_index, args=(i, video_url))
+            track_hint = album.tracks[i] if album and i < len(album.tracks) else None
+
+            # Pre-check with known track names to skip files before making any network request.
+            if track_hint:
+                hinted_title = Title(track_hint)
+                hinted_path = os.path.join(output_folder, f'{hinted_title.file_name}.{format}')
+                if os.path.exists(hinted_path):
+                    g_download_worker.abort_task()
+                    add_download_result(RESULT_SKIPPED, hinted_title.display_name, "File already exists")
+                    continue
+
+            thread = threading.Thread(target=download_video_at_index, args=(i, video_url, track_hint))
             threads.append(thread)
             thread.start()
+            # Avoid bursting requests too quickly, which can trigger bot detection.
+            if i < len(urls) - 1 and YOUTUBE_REQUEST_SPACING_SECONDS > 0:
+                time.sleep(YOUTUBE_REQUEST_SPACING_SECONDS)
         
         # Wait for all threads to complete
         for thread in threads:
             thread.join()
-
-        if not any(result is not None for result in results):
-            print(f"{COLOR_ERROR}Failed to download any tracks from the playlist.{COLOR_RESET}")
-            return None
 
         return output_folder
     except Exception as e:
@@ -1164,7 +1311,7 @@ def download_youtube_thumbnail(url, output_folder, name):
             video_url = url
 
         # Create a YouTube object for the selected video
-        yt = YouTube(video_url)
+        yt = create_youtube_client(video_url)
 
         # Get the thumbnail URL
         thumbnail_url = yt.thumbnail_url
@@ -1319,6 +1466,55 @@ def extract_playlist_video_urls(playlist_url):
         return [f"https://www.youtube.com/watch?v={video_id}" for video_id in unique_ids]
     except Exception:
         return []
+
+def _is_bot_detection_error(error):
+    text = str(error).lower()
+    return "detected as a bot" in text or "po_token" in text
+
+def _get_po_token_verifier_from_env():
+    visitor_data = os.getenv(YT_VISITOR_DATA_ENV)
+    po_token = os.getenv(YT_PO_TOKEN_ENV)
+    if not visitor_data or not po_token:
+        return None
+    return lambda _: (visitor_data, po_token)
+
+def create_youtube_client(url):
+    """
+    Creates a resilient pytubefix YouTube client, retrying with alternate
+    clients and optional PO token settings when bot detection is triggered.
+    """
+    bot_error = None
+
+    try:
+        return YouTube(url)
+    except Exception as e:
+        if not _is_bot_detection_error(e):
+            raise
+        bot_error = e
+
+    po_token_verifier = _get_po_token_verifier_from_env()
+    if po_token_verifier is not None:
+        try:
+            return YouTube(url, use_po_token=True, po_token_verifier=po_token_verifier)
+        except Exception as e:
+            if not _is_bot_detection_error(e):
+                raise
+            bot_error = e
+
+    for client in ["TV", "WEB", "MWEB"]:
+        try:
+            return YouTube(url, client=client)
+        except Exception as e:
+            if not _is_bot_detection_error(e):
+                raise
+            bot_error = e
+
+    print(
+        f"{COLOR_INFO}YouTube bot detection is blocking this request. "
+        f"Set {YT_VISITOR_DATA_ENV} and {YT_PO_TOKEN_ENV} environment variables to enable PO token fallback.{COLOR_RESET}"
+    )
+
+    raise bot_error if bot_error else RuntimeError("Failed to create YouTube client")
 
 def main():
     print("Welcome to the AlbumWorks downloader!")
@@ -1516,6 +1712,7 @@ def main():
         print()
 
         # Prompt for YouTube URL
+        g_result_display.reset()
         url = input("Enter the YouTube video or playlist URL: ").strip()
         if len(url) == 0:
             print(f"{COLOR_ERROR}No URL given.{COLOR_RESET}")
@@ -1589,7 +1786,8 @@ def main():
             print(f"{COLOR_INFO}Processing video...{COLOR_RESET}")
             global g_download_worker
             g_download_worker = Worker(4, 1)
-            output_folder = download_youtube_video(url, album_path, format, album, limit=limit)
+            single_track_hint = album.tracks[0] if album and len(album.tracks) == 1 else None
+            output_folder = download_youtube_video(url, album_path, format, album, limit=limit, title_hint=single_track_hint)
             # Get the output folder from the returned file path
             if output_folder is not None and os.path.isfile(output_folder):
                 output_folder = os.path.dirname(output_folder)
@@ -1597,11 +1795,8 @@ def main():
             print(f"{COLOR_ERROR}Invalid URL. Please provide a valid YouTube video or playlist URL.{COLOR_RESET}")
             continue
 
-        if output_folder is None:
-            print(f"{COLOR_ERROR}Download failed.{COLOR_RESET}")
-        else:
-            print(f"{COLOR_SUCCESS}Download successful.{COLOR_RESET}")
-            print(f"{COLOR_INFO}Files saved to: {output_folder}.{COLOR_RESET}\n")
+        g_result_display.print_results()
+        g_result_display.print_summary()
         
         # Delete thumbnail if it was downloaded
         if album_artwork_temporary and os.path.exists(album_artwork):
