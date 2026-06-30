@@ -13,6 +13,10 @@ import concurrent.futures
 import time
 import random
 
+APP_NAME = "AlbumWorks"
+APP_VERSION = "1.0.4"
+APP_URL = "https://github.com/mtalyat/AlbumWorks"
+
 FFMPEG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "ffmpeg", "bin", "ffmpeg.exe")
 OUTPUT_PATH = os.path.join(os.path.expanduser("~"), "Music")
 FORMATS = ["mp3", "wav", "mp4a"]
@@ -591,7 +595,7 @@ def setup_musicbrainz():
     """
     Sets up the MusicBrainz client with user agent and rate limiting.
     """
-    musicbrainzngs.set_useragent("AlbumWorks", "1.0", "https://github.com/mtalyat/AlbumWorks")
+    musicbrainzngs.set_useragent(APP_NAME, APP_VERSION, APP_URL)
     musicbrainzngs.set_rate_limit(limit_or_interval=1.0, new_requests=1)
     musicbrainz_delay()
 
@@ -654,7 +658,7 @@ def get_album_info(album_name, artist_info):
 
     try:
         # Search for all releases by name and artist to find the oldest
-        result = safe_musicbrainz_request(musicbrainzngs.search_releases, release=album_name, artist=artist_name, limit=100)
+        result = safe_musicbrainz_request(musicbrainzngs.search_releases, release=album_name, artist=artist_info["name"], limit=100)
         if not result["release-list"]:
             return {"not found": "Album not found"}
     except Exception as e:
@@ -668,7 +672,7 @@ def get_album_info(album_name, artist_info):
             valid_releases = []
             for release in result["release-list"]:
                 if (release["title"].lower() == album_name.lower() and 
-                    release["artist-credit"][0]["artist"]["name"].lower() == artist_name.lower() and
+                    release["artist-credit"][0]["artist"]["name"].lower() == artist_info["name"].lower() and
                     release.get("date")):
                     valid_releases.append(release)
             
@@ -1149,6 +1153,9 @@ def main():
     print("You can download individual videos or entire playlists.")
     print()
     print("Setup:")
+
+    # Configure MusicBrainz before making any requests.
+    setup_musicbrainz()
     
     # Prompt for output format
     formats_list = ", ".join(FORMATS)
@@ -1176,8 +1183,32 @@ def main():
     os.system(f'title AlbumWorks')
 
     album_info_cache: list[Album] = list()
-    artist_info_cache: list[dict] = list()
+    artist_info_cache: list[tuple[str, dict]] = list()
     ALBUM_INFO_CACHE_SIZE = 10
+    ARTIST_INFO_CACHE_SIZE = 20
+
+    def get_cached_artist_info(artist_name):
+        key = artist_name.lower()
+        for i, (cached_key, artist_info) in enumerate(artist_info_cache):
+            if cached_key == key:
+                # Move to front of cache (most recently used)
+                artist_info_cache.pop(i)
+                artist_info_cache.insert(0, (cached_key, artist_info))
+                return artist_info
+        return None
+
+    def cache_artist_info(artist_name, artist_info):
+        key = artist_name.lower()
+
+        # Remove existing entry for this key before inserting at the front
+        for i, (cached_key, _) in enumerate(artist_info_cache):
+            if cached_key == key:
+                artist_info_cache.pop(i)
+                break
+
+        artist_info_cache.insert(0, (key, artist_info))
+        if len(artist_info_cache) > ARTIST_INFO_CACHE_SIZE:
+            artist_info_cache.pop()
     
     while True:
         print_line()
@@ -1192,18 +1223,28 @@ def main():
         else:
             print(f"{COLOR_ERROR}No album artist given.{COLOR_RESET}")
             continue
-        # TODO: IF artist info is already cached, use it
-        # Get the artist info from MusicBrainz in the background while user types out the album name
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(get_artist_info, album_artist)
-
+        artist_info = get_cached_artist_info(album_artist)
+        if artist_info is not None:
+            print(f"{COLOR_INFO}Using cached artist information.{COLOR_RESET}")
             album_name_input = input("Enter the album name: ").strip()
+        else:
+            # Get the artist info from MusicBrainz in the background while user types out the album name
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(get_artist_info, album_artist)
 
-            artist_info = future.result()
+                album_name_input = input("Enter the album name: ").strip()
+
+                artist_info = future.result()
+
             if "error" in artist_info or "not found" in artist_info:
-                pass # do nothing, use the input name
+                # Fall back to typed artist name so album lookup can still proceed.
+                artist_info = {"name": album_artist}
             else:
-                album_artist = artist_info.get("name", album_artist) # replace name in case spelling was off
+                # Cache both the entered and canonical artist names
+                cache_artist_info(album_artist, artist_info)
+                canonical_artist_name = artist_info.get("name", album_artist)
+                cache_artist_info(canonical_artist_name, artist_info)
+                album_artist = canonical_artist_name # replace name in case spelling was off
         if len(album_name_input) > 0:
             album_name = album_name_input
         elif len(album_name) > 0:
