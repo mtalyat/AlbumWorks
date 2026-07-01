@@ -64,6 +64,9 @@ class DownloadResultDisplay:
                 return
             snapshot = list(self.results)
 
+        # Sort by numeric track number first (1,2,...,10), then by item name.
+        snapshot.sort(key=lambda r: (r[3] is None, r[3] if r[3] is not None else float('inf'), r[1].lower()))
+
         print()
         for status, item, detail, track_number in snapshot:
             color = COLOR_INFO
@@ -129,6 +132,7 @@ class Worker:
         with self.lock:
             self.task_count -= 1
             self.total -= self.task_weight
+        self.display()
 
     def start_task(self, id, priority) -> bool:
         self.wait_for_task(id)
@@ -1244,6 +1248,8 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
 
         # Create a folder for the video's segments
         os.makedirs(output_folder, exist_ok=True)
+
+        print(f"{COLOR_INFO}Splitting \"{title_str}\" into {len(segments)} tracks...{COLOR_RESET}")
 
         # Split the audio into segments
         split_audio(wav_file, segments, output_folder, format, album)
