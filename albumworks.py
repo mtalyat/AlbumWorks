@@ -1702,17 +1702,43 @@ def main():
                 return None
 
             entry_parts = entry.split()
-            url_candidate = entry_parts[0]
-            limit_value = None
+            first_token = entry_parts[0]
+            looks_like_url = get_playlist_url(first_token) is not None or "youtu" in first_token.lower()
 
-            if get_playlist_url(url_candidate) is not None or "youtu" in url_candidate.lower():
-                if len(entry_parts) > 1:
-                    try:
-                        limit_value = int(entry_parts[1])
-                    except ValueError:
-                        print(f"{COLOR_ERROR}Invalid limit value: {entry_parts[1]}{COLOR_RESET}")
-                        continue
-                return (url_candidate, limit_value)
+            # URL mode: support one or many URL entries separated by semicolons.
+            if ";" in entry or looks_like_url:
+                url_requests = []
+                invalid_input = False
+                for chunk in [part.strip() for part in entry.split(";") if part.strip()]:
+                    chunk_parts = chunk.split()
+                    url_candidate = chunk_parts[0]
+                    if get_playlist_url(url_candidate) is None and "youtu" not in url_candidate.lower():
+                        print(f"{COLOR_ERROR}Invalid YouTube URL: {url_candidate}{COLOR_RESET}")
+                        invalid_input = True
+                        break
+
+                    chunk_limit = None
+                    if len(chunk_parts) > 1:
+                        try:
+                            chunk_limit = int(chunk_parts[1])
+                        except ValueError:
+                            print(f"{COLOR_ERROR}Invalid limit value: {chunk_parts[1]}{COLOR_RESET}")
+                            invalid_input = True
+                            break
+                    if len(chunk_parts) > 2:
+                        print(f"{COLOR_ERROR}Too many values for URL entry: {chunk}{COLOR_RESET}")
+                        invalid_input = True
+                        break
+
+                    url_requests.append((url_candidate, chunk_limit))
+
+                if invalid_input:
+                    continue
+                if len(url_requests) == 0:
+                    print(f"{COLOR_ERROR}No URL given.{COLOR_RESET}")
+                    continue
+
+                return url_requests
 
             choice = entry.lower()
 
@@ -1846,7 +1872,8 @@ def main():
             print(f"{COLOR_INFO}Input cancelled.{COLOR_RESET}")
             continue
 
-        url, limit = edit_or_url
+        url_requests = edit_or_url
+        primary_url = url_requests[0][0]
 
         # Keep local album values aligned with any manual edits.
         album_name = album.name
@@ -1869,7 +1896,7 @@ def main():
 
             # Prompt for artwork, if user wants to override
             if len(album_artwork) == 0 or album_artwork.lower() == "thumbnail":
-                album_artwork = download_youtube_thumbnail(url, OUTPUT_PATH, THUMBNAIL_NAME)
+                album_artwork = download_youtube_thumbnail(primary_url, OUTPUT_PATH, THUMBNAIL_NAME)
                 album_artwork_type = ARTWORK_TYPE_THUMBNAIL
             elif album_artwork.lower() == "thumbnail":
                 album_artwork_type = ARTWORK_TYPE_THUMBNAIL
@@ -1894,7 +1921,7 @@ def main():
         elif album_artwork_type == ARTWORK_TYPE_THUMBNAIL:
             # Use the YouTube thumbnail
             album_artwork_temporary = True
-            album_artwork = download_youtube_thumbnail(url, OUTPUT_PATH, THUMBNAIL_NAME)
+            album_artwork = download_youtube_thumbnail(primary_url, OUTPUT_PATH, THUMBNAIL_NAME)
         else:
             print(f"{COLOR_ERROR}Invalid artwork type.{COLOR_RESET}")
             continue
@@ -1903,24 +1930,29 @@ def main():
         album.artwork = album_artwork
 
         album_path = os.path.join(output_folder, album.get_folder_name())
-        playlist_url = get_playlist_url(url)
-        if playlist_url is not None:
-            # Process as a playlist
-            print(f"{COLOR_INFO}Processing playlist...{COLOR_RESET}")
-            output_folder = download_youtube_playlist(playlist_url, album_path, format, album, limit)
-        elif "youtu" in url:
-            # Process as a single video
-            print(f"{COLOR_INFO}Processing video...{COLOR_RESET}")
-            global g_download_worker
-            g_download_worker = Worker(4, 1)
-            single_track_hint = album.tracks[0] if album and len(album.tracks) == 1 else None
-            output_folder = download_youtube_video(url, album_path, format, album, limit=limit, title_hint=single_track_hint)
-            # Get the output folder from the returned file path
-            if output_folder is not None and os.path.isfile(output_folder):
-                output_folder = os.path.dirname(output_folder)
-        else:
-            print(f"{COLOR_ERROR}Invalid URL. Please provide a valid YouTube video or playlist URL.{COLOR_RESET}")
-            continue
+        for request_index, (request_url, request_limit) in enumerate(url_requests):
+            playlist_url = get_playlist_url(request_url)
+            if playlist_url is not None:
+                # Process as a playlist
+                print(f"{COLOR_INFO}Processing playlist...{COLOR_RESET}")
+                output_folder = download_youtube_playlist(playlist_url, album_path, format, album, request_limit)
+            elif "youtu" in request_url:
+                # Process as a single video
+                print(f"{COLOR_INFO}Processing video...{COLOR_RESET}")
+                global g_download_worker
+                g_download_worker = Worker(4, 1)
+                single_track_hint = None
+                if album and request_index < len(album.tracks):
+                    single_track_hint = album.tracks[request_index]
+                elif album and len(album.tracks) == 1:
+                    single_track_hint = album.tracks[0]
+                output_folder = download_youtube_video(request_url, album_path, format, album, i=request_index, limit=request_limit, title_hint=single_track_hint)
+                # Get the output folder from the returned file path
+                if output_folder is not None and os.path.isfile(output_folder):
+                    output_folder = os.path.dirname(output_folder)
+            else:
+                print(f"{COLOR_ERROR}Invalid URL. Please provide a valid YouTube video or playlist URL.{COLOR_RESET}")
+                continue
 
         g_result_display.print_results()
         g_result_display.print_summary()
