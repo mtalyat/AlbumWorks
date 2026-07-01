@@ -1,4 +1,5 @@
 import difflib
+import json
 import musicbrainzngs
 import os
 import re
@@ -30,6 +31,9 @@ TRIM_SILENCE_MIN_DURATION = "0.25"
 YT_PO_TOKEN_ENV = "ALBUMWORKS_YT_PO_TOKEN"
 YT_VISITOR_DATA_ENV = "ALBUMWORKS_YT_VISITOR_DATA"
 YOUTUBE_REQUEST_SPACING_SECONDS = 0.5
+CACHE_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
+ARTIST_CACHE_FILE = os.path.join(CACHE_DIRECTORY, "artist_cache.json")
+ALBUM_CACHE_FILE = os.path.join(CACHE_DIRECTORY, "album_cache.json")
 
 ARTWORK_TYPES = ['file', 'url', 'thumbnail']
 ARTWORK_TYPE_FILE = 0 # file on disk
@@ -89,6 +93,7 @@ g_result_display = DownloadResultDisplay()
 g_track_prompt_lock = threading.Lock()
 g_pending_track_assignments = []
 g_pending_track_assignments_lock = threading.Lock()
+g_album_cache_save_callback = None
 
 def add_download_result(status, item, detail = None, track_number = None):
     global g_result_display
@@ -130,6 +135,11 @@ def pop_pending_track_assignments():
         pending = list(g_pending_track_assignments)
         g_pending_track_assignments.clear()
     return pending
+
+def save_album_cache_if_available():
+    global g_album_cache_save_callback
+    if g_album_cache_save_callback is not None:
+        g_album_cache_save_callback()
 
 class WorkerTask:
     def __init__(self, priority):
@@ -484,6 +494,7 @@ class Album:
             self.used.append(True)
             self.tracks.append(name)
             self.lowered_tracks.append(name.lower())
+        save_album_cache_if_available()
         return index
     
     def get_folder_name(self):
@@ -509,6 +520,69 @@ Album Information:
     def clear_temporary_data(self):
         with self.lock:
             self.used = [False] * len(self.tracks)
+
+def _load_json_file(path, default_value):
+    try:
+        if not os.path.exists(path):
+            return default_value
+        with open(path, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except Exception:
+        return default_value
+
+def _save_json_file(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as file:
+            json.dump(data, file, ensure_ascii=True, indent=2)
+    except Exception as e:
+        print(f"{COLOR_ERROR}Failed to save cache file {path}. Error: {e}{COLOR_RESET}")
+
+def load_artist_cache_from_file(path, max_size):
+    data = _load_json_file(path, [])
+    cache = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        key = entry.get("key")
+        artist_info = entry.get("artist_info")
+        if not isinstance(key, str) or not isinstance(artist_info, dict):
+            continue
+        cache.append((key, artist_info))
+    return cache[:max_size]
+
+def save_artist_cache_to_file(path, artist_info_cache):
+    data = []
+    for key, artist_info in artist_info_cache:
+        if isinstance(key, str) and isinstance(artist_info, dict):
+            data.append({"key": key, "artist_info": artist_info})
+    _save_json_file(path, data)
+
+def load_album_cache_from_file(path, max_size):
+    data = _load_json_file(path, [])
+    cache = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        artist = entry.get("artist")
+        tracks = entry.get("tracks")
+        if not isinstance(name, str) or not isinstance(artist, str) or not isinstance(tracks, list):
+            continue
+        cache.append(Album(name, artist, entry.get("year"), entry.get("genre"), tracks, entry.get("artwork")))
+    return cache[:max_size]
+
+def save_album_cache_to_file(path, album_info_cache):
+    data = []
+    for album in album_info_cache:
+        data.append({
+            "name": album.name,
+            "artist": album.artist,
+            "year": album.year,
+            "genre": album.genre,
+            "tracks": list(album.tracks),
+            "artwork": album.artwork,
+        })
+    _save_json_file(path, data)
     
 def _update_metadata(file_path, title, artist, album, track_number, year=None, genre=None, artwork=None):
     """
@@ -1718,6 +1792,7 @@ def process_pending_track_assignments():
                 album.tracks.append(title_guess)
                 album.lowered_tracks.append(title_guess.lower())
                 album.used.append(True)
+            save_album_cache_if_available()
 
         worker = Worker(4, 1, show_progress=False)
         download_youtube_video(
@@ -2009,10 +2084,39 @@ def main():
     album_name = ""
     os.system(f'title AlbumWorks')
 
-    album_info_cache: list[Album] = list()
-    artist_info_cache: list[tuple[str, dict]] = list()
     ALBUM_INFO_CACHE_SIZE = 10
     ARTIST_INFO_CACHE_SIZE = 20
+    album_info_cache: list[Album] = load_album_cache_from_file(ALBUM_CACHE_FILE, ALBUM_INFO_CACHE_SIZE)
+    artist_info_cache: list[tuple[str, dict]] = load_artist_cache_from_file(ARTIST_CACHE_FILE, ARTIST_INFO_CACHE_SIZE)
+
+    if album_info_cache:
+        album_artist = album_info_cache[0].artist
+        album_name = album_info_cache[0].name
+    elif artist_info_cache:
+        cached_artist_info = artist_info_cache[0][1]
+        album_artist = cached_artist_info.get("name", artist_info_cache[0][0])
+
+    def save_artist_cache():
+        save_artist_cache_to_file(ARTIST_CACHE_FILE, artist_info_cache)
+
+    def save_album_cache():
+        save_album_cache_to_file(ALBUM_CACHE_FILE, album_info_cache)
+
+    global g_album_cache_save_callback
+    g_album_cache_save_callback = save_album_cache
+
+    def clear_last_used_info_line():
+        print("\033[2A\r\033[2K\033[1B", end="", flush=True)
+
+    def prompt_with_last_used(prompt_text, last_value, label):
+        showed_last_used = False
+        if len(last_value) > 0:
+            print(f"{COLOR_INFO}Last used {label}: {last_value}{COLOR_RESET}")
+            showed_last_used = True
+        value = input(prompt_text).strip()
+        if showed_last_used and len(value) == 0:
+            clear_last_used_info_line()
+        return value
 
     def get_cached_artist_info(artist_name):
         key = artist_name.lower()
@@ -2021,6 +2125,7 @@ def main():
                 # Move to front of cache (most recently used)
                 artist_info_cache.pop(i)
                 artist_info_cache.insert(0, (cached_key, artist_info))
+                save_artist_cache()
                 return artist_info
         return None
 
@@ -2036,6 +2141,29 @@ def main():
         artist_info_cache.insert(0, (key, artist_info))
         if len(artist_info_cache) > ARTIST_INFO_CACHE_SIZE:
             artist_info_cache.pop()
+        save_artist_cache()
+
+    def get_cached_album_info(artist_name, album_title):
+        target_artist = artist_name.lower()
+        target_name = album_title.lower()
+        for i, album in enumerate(album_info_cache):
+            if album.name.lower() == target_name and album.artist.lower() == target_artist:
+                album.clear_temporary_data()
+                album_info_cache.pop(i)
+                album_info_cache.insert(0, album)
+                save_album_cache()
+                return album
+        return None
+
+    def cache_album_info(album):
+        for i, cached_album in enumerate(album_info_cache):
+            if cached_album.name.lower() == album.name.lower() and cached_album.artist.lower() == album.artist.lower():
+                album_info_cache.pop(i)
+                break
+        album_info_cache.insert(0, album)
+        if len(album_info_cache) > ALBUM_INFO_CACHE_SIZE:
+            album_info_cache.pop()
+        save_album_cache()
 
     def parse_artist_names(artist_text):
         return [name.strip() for name in artist_text.split(";") if name.strip()]
@@ -2165,6 +2293,7 @@ def main():
                 print(f"{COLOR_ERROR}Input must be a supported attribute or a YouTube URL.{COLOR_RESET}")
                 continue
 
+            save_album_cache()
             print(f"{COLOR_INFO}Updated album information:{COLOR_RESET}")
             album.print()
     
@@ -2173,11 +2302,11 @@ def main():
         output_folder = base_output_folder
 
         # Prompt for album information
-        album_artist_input = input("Enter the album artist: ").strip()
+        album_artist_input = prompt_with_last_used("Enter the album artist: ", album_artist, "artist")
         if len(album_artist_input) > 0:
             album_artist = album_artist_input
         elif len(album_artist) > 0:
-            print(f"{COLOR_INFO}Album artist set to previous value: {album_artist}.{COLOR_RESET}")
+            pass
         else:
             print(f"{COLOR_ERROR}No album artist given.{COLOR_RESET}")
             continue
@@ -2196,14 +2325,14 @@ def main():
                 artist_info = None
         if artist_info is not None:
             print(f"{COLOR_INFO}Using cached artist information.{COLOR_RESET}")
-            album_name_input = input("Enter the album name: ").strip()
+            album_name_input = prompt_with_last_used("Enter the album name: ", album_name, "album")
         else:
             # Get the artist info from MusicBrainz in the background while user types out the album name
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 print(f"{COLOR_INFO}Retrieving artist information...{COLOR_RESET}")
                 future = executor.submit(get_artist_info, search_artist)
 
-                album_name_input = input("Enter the album name: ").strip()
+                album_name_input = prompt_with_last_used("Enter the album name: ", album_name, "album")
 
                 artist_info = future.result()
 
@@ -2225,22 +2354,14 @@ def main():
         if len(album_name_input) > 0:
             album_name = album_name_input
         elif len(album_name) > 0:
-            print(f"{COLOR_INFO}Album name set to previous value: {album_name}.{COLOR_RESET}")
+            pass
         else:
             print(f"{COLOR_ERROR}No album name given.{COLOR_RESET}")
             continue
 
-        album = None
-        for album_info in album_info_cache:
-            if album_info.name.lower() == album_name.lower() and album_info.artist.lower() == album_artist.lower():
-                album = album_info
-                # Clear the album's temporary data
-                album.clear_temporary_data()
+        album = get_cached_album_info(album_artist, album_name)
         if album is not None:
             print(f"{COLOR_INFO}Using cached album information.{COLOR_RESET}")
-            # Move to front of cache
-            album_info_cache.remove(album)
-            album_info_cache.insert(0, album)
         else:
             print(f"{COLOR_INFO}Retrieving album information...{COLOR_RESET}")
             album_info = get_album_info(album_name, artist_info)
@@ -2264,10 +2385,7 @@ def main():
                 album_genre = album_info["genre"]
                 album_tracks = album_info["tracks"]
             album = Album(album_name, album_artist, album_year, album_genre, album_tracks, None)
-            # Add to cache
-            album_info_cache.insert(0, album)
-            if len(album_info_cache) > ALBUM_INFO_CACHE_SIZE:
-                album_info_cache.pop()
+            cache_album_info(album)
 
         # Print album information
         album.print()
@@ -2282,6 +2400,7 @@ def main():
         # Keep local album values aligned with any manual edits.
         album_name = album.name
         album_artist = album.artist
+        save_album_cache()
         print()
 
         g_result_display.reset()
