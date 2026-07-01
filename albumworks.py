@@ -535,6 +535,7 @@ def split_audio(file_path, segments, output_folder, format, album):
         title = Title(name)
         title.fix_title(album, False)
         title_str = str(title)
+        track_number = title.track_index + 1 if title.track_index != -1 else i + 1
         try:
             params = audio.getparams()
             frame_rate = params.framerate
@@ -550,7 +551,7 @@ def split_audio(file_path, segments, output_folder, format, album):
 
             if not g_audio_split_worker.start_task(title_str, i):
                 g_audio_split_worker.abort_task()
-                add_download_result(RESULT_SKIPPED, title_str, "Segment was skipped", i + 1)
+                add_download_result(RESULT_SKIPPED, title_str, "Segment was skipped", track_number)
                 return
             g_audio_split_worker.increment(title_str)
 
@@ -563,16 +564,16 @@ def split_audio(file_path, segments, output_folder, format, album):
             final_file = convert_file(output_path, format)
             if not final_file:
                 g_audio_split_worker.cancel_task(title_str)
-                add_download_result(RESULT_ERROR, title_str, "Segment conversion failed", i + 1)
+                add_download_result(RESULT_ERROR, title_str, "Segment conversion failed", track_number)
                 return
             g_audio_split_worker.increment(title_str)
 
             update_metadata(final_file, album, title)
             g_audio_split_worker.increment(title_str)
-            add_download_result(RESULT_SUCCESS, title_str, final_file, i + 1)
+            add_download_result(RESULT_SUCCESS, title_str, final_file, track_number)
         except Exception as e:
             g_audio_split_worker.cancel_task(title_str)
-            add_download_result(RESULT_ERROR, title_str, f"Segment processing failed: {e}", i + 1)
+            add_download_result(RESULT_ERROR, title_str, f"Segment processing failed: {e}", track_number)
 
     with wave.open(file_path, "rb") as audio:
         threads = []
@@ -730,14 +731,70 @@ def get_artist_info(artist_name):
     Returns:
         dict: Artist information including genres and tags.
     """
+    def normalize_name(name):
+        return re.sub(r"\s+", " ", name.strip().lower())
+
+    def has_alias_match(artist, target_normalized):
+        for alias in artist.get("alias-list", []):
+            alias_name = alias.get("alias", "")
+            if normalize_name(alias_name) == target_normalized:
+                return True
+        return False
+
+    def to_score(value):
+        try:
+            return int(value)
+        except Exception:
+            return -1
+
+    def similarity(a, b):
+        return difflib.SequenceMatcher(None, a, b).ratio()
+
+    def candidate_rank(artist, target_normalized):
+        artist_name_normalized = normalize_name(artist.get("name", ""))
+        alias_match = has_alias_match(artist, target_normalized)
+        exact_name = artist_name_normalized == target_normalized
+        starts_with = artist_name_normalized.startswith(target_normalized) or target_normalized.startswith(artist_name_normalized)
+        contains = target_normalized in artist_name_normalized or artist_name_normalized in target_normalized
+        return (
+            1 if exact_name else 0,
+            1 if alias_match else 0,
+            1 if starts_with else 0,
+            1 if contains else 0,
+            similarity(artist_name_normalized, target_normalized),
+            to_score(artist.get("ext:score", artist.get("score", -1)))
+        )
+
     try:
-        # Search for the artist by name
-        result = safe_musicbrainz_request(musicbrainzngs.search_artists, artist=artist_name, limit=10)
-        if not result["artist-list"]:
+        # Search for the artist by name. Use strict matching first, then broad search.
+        strict_result = safe_musicbrainz_request(
+            musicbrainzngs.search_artists,
+            artist=artist_name,
+            limit=100,
+            strict=True
+        )
+        musicbrainz_delay()
+
+        strict_list = strict_result.get("artist-list", []) if strict_result else []
+
+        broad_result = safe_musicbrainz_request(
+            musicbrainzngs.search_artists,
+            artist=artist_name,
+            limit=100
+        )
+        broad_list = broad_result.get("artist-list", []) if broad_result else []
+        if not broad_list and not strict_list:
             return {"not found": "Artist not found"}
         musicbrainz_delay()
 
-        artist_id = result["artist-list"][0]["id"]
+        # Prefer strict candidates when available.
+        artist_list = strict_list if strict_list else broad_list
+        target_normalized = normalize_name(artist_name)
+
+        # Choose best candidate by exact/alias/prefix/contains/similarity/score.
+        best_artist = max(artist_list, key=lambda a: candidate_rank(a, target_normalized))
+
+        artist_id = best_artist["id"]
 
         # Fetch artist details including tags
         artist_details = safe_musicbrainz_request(musicbrainzngs.get_artist_by_id, artist_id, includes=["tags"])
@@ -1068,6 +1125,11 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
         if title_hint:
             hinted_title = Title(title_hint)
             hinted_path = os.path.join(output_folder, f'{hinted_title.file_name}.{format}')
+            if album:
+                for idx, track_name in enumerate(album.tracks):
+                    if track_name and track_name.lower() == hinted_title.display_name.lower():
+                        track_number = idx + 1
+                        break
             if os.path.exists(hinted_path):
                 g_download_worker.abort_task()
                 add_download_result(RESULT_SKIPPED, hinted_title.display_name, "File already exists", track_number)
@@ -1108,6 +1170,8 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
         else: # this video has segments (each segment is a song)
             title.fix_title(None, True)
         title_str = str(title)
+        if title.track_index != -1:
+            track_number = title.track_index + 1
 
         if not g_download_worker.start_task(title_str, i):
             g_download_worker.abort_task()
@@ -1577,6 +1641,38 @@ def main():
         if len(artist_info_cache) > ARTIST_INFO_CACHE_SIZE:
             artist_info_cache.pop()
 
+    def parse_artist_names(artist_text):
+        return [name.strip() for name in artist_text.split(";") if name.strip()]
+
+    def normalize_artist_name(name):
+        return re.sub(r"\s+", " ", (name or "").strip().lower())
+
+    def combine_artist_names(primary_artist, additional_artists):
+        names = []
+        seen = set()
+        for name in [primary_artist] + list(additional_artists):
+            lowered = name.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            names.append(name)
+        return ", ".join(names)
+
+    def resolve_artist_canonical_name(artist_name):
+        cached_info = get_cached_artist_info(artist_name)
+        if cached_info is not None:
+            if normalize_artist_name(cached_info.get("name", "")) == normalize_artist_name(artist_name):
+                return cached_info.get("name", artist_name), cached_info
+
+        info = get_artist_info(artist_name)
+        if "error" in info or "not found" in info:
+            return artist_name, {"name": artist_name}
+
+        cache_artist_info(artist_name, info)
+        canonical_name = info.get("name", artist_name)
+        cache_artist_info(canonical_name, info)
+        return canonical_name, info
+
     def prompt_tracks_input(existing_tracks = None):
         tracks = list(existing_tracks) if existing_tracks else []
         while True:
@@ -1650,14 +1746,26 @@ def main():
         else:
             print(f"{COLOR_ERROR}No album artist given.{COLOR_RESET}")
             continue
-        artist_info = get_cached_artist_info(album_artist)
+
+        artist_names = parse_artist_names(album_artist)
+        if not artist_names:
+            print(f"{COLOR_ERROR}No album artist given.{COLOR_RESET}")
+            continue
+
+        search_artist = artist_names[0]
+        additional_artists = artist_names[1:]
+
+        artist_info = get_cached_artist_info(search_artist)
+        if artist_info is not None:
+            if normalize_artist_name(artist_info.get("name", "")) != normalize_artist_name(search_artist):
+                artist_info = None
         if artist_info is not None:
             print(f"{COLOR_INFO}Using cached artist information.{COLOR_RESET}")
             album_name_input = input("Enter the album name: ").strip()
         else:
             # Get the artist info from MusicBrainz in the background while user types out the album name
             with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(get_artist_info, album_artist)
+                future = executor.submit(get_artist_info, search_artist)
 
                 album_name_input = input("Enter the album name: ").strip()
 
@@ -1665,13 +1773,19 @@ def main():
 
             if "error" in artist_info or "not found" in artist_info:
                 # Fall back to typed artist name so album lookup can still proceed.
-                artist_info = {"name": album_artist}
+                artist_info = {"name": search_artist}
             else:
                 # Cache both the entered and canonical artist names
-                cache_artist_info(album_artist, artist_info)
-                canonical_artist_name = artist_info.get("name", album_artist)
+                cache_artist_info(search_artist, artist_info)
+                canonical_artist_name = artist_info.get("name", search_artist)
                 cache_artist_info(canonical_artist_name, artist_info)
-                album_artist = canonical_artist_name # replace name in case spelling was off
+
+        canonical_additional_artists = []
+        for additional_artist in additional_artists:
+            canonical_name, _ = resolve_artist_canonical_name(additional_artist)
+            canonical_additional_artists.append(canonical_name)
+
+        album_artist = combine_artist_names(artist_info.get("name", search_artist), canonical_additional_artists)
         if len(album_name_input) > 0:
             album_name = album_name_input
         elif len(album_name) > 0:
@@ -1709,7 +1823,7 @@ def main():
                 album_tracks = prompt_tracks_input([])
             else:
                 album_name = album_info["name"]
-                album_artist = album_info["artist"]
+                album_artist = combine_artist_names(album_info["artist"], canonical_additional_artists)
                 album_year = album_info["release_date"][:4]
                 album_genre = album_info["genre"]
                 album_tracks = album_info["tracks"]
