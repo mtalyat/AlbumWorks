@@ -277,12 +277,22 @@ class Title:
         if not album:
             self.set_title(title)
             return
+
+        def remove_phrase_tokens(source_text: str, phrase: str) -> str:
+            """Remove a phrase even if separators/punctuation differ in the source text."""
+            if not phrase:
+                return source_text
+            tokens = re.findall(r"[A-Za-z0-9']+", phrase)
+            if not tokens:
+                return source_text
+            pattern = r"\b" + r"\W*".join(re.escape(token) for token in tokens) + r"\b"
+            return re.sub(pattern, "", source_text, flags=re.IGNORECASE)
         
         # Remove any mention of the artist name
-        title = re.sub(rf'{album.artist}', '', title, flags=re.IGNORECASE).strip()
+        title = remove_phrase_tokens(title, album.artist).strip()
 
         # Remove any mention of the album name
-        temp = re.sub(rf'{album.name}', '', title, flags=re.IGNORECASE).strip()
+        temp = remove_phrase_tokens(title, album.name).strip()
 
         # If the title is empty, use the album name
         empty_pattern = r'^[^a-zA-Z0-9]*$'
@@ -295,6 +305,9 @@ class Title:
         track_index = album.get_track_index(title, readonly)
         if track_index != -1:
             title = album.tracks[track_index]
+        elif re.fullmatch(empty_pattern, title):
+            # If cleanup removed everything, fall back to the album title.
+            title = album.name
 
         self.set_title(title, track_index)
 
@@ -523,6 +536,81 @@ def parse_timestamps(description):
         segments.append((total_seconds, name.strip()))
     return segments
 
+def parse_index_selector(selector_expr, length):
+    """
+    Parses a selector expression and returns selected zero-based indices.
+    Integer values are 1-based for user input.
+    Supported examples:
+      [:3]
+      [1, 2, 4]
+      [:3, 5]
+      [1:10:2]
+    """
+    if selector_expr is None:
+        return list(range(length))
+
+    text = selector_expr.strip()
+    if len(text) >= 2 and text[0] == "[" and text[-1] == "]":
+        text = text[1:-1]
+    text = text.strip()
+
+    if len(text) == 0:
+        return list(range(length))
+
+    selected = []
+    seen = set()
+
+    def append_index(idx):
+        if idx not in seen:
+            seen.add(idx)
+            selected.append(idx)
+
+    for raw_part in text.split(","):
+        part = raw_part.strip()
+        if len(part) == 0:
+            continue
+
+        if ":" in part:
+            slice_parts = part.split(":")
+            if len(slice_parts) > 3:
+                raise ValueError(f"Invalid selector part: {part}")
+
+            slice_values = []
+            for value in slice_parts:
+                value = value.strip()
+                if len(value) == 0:
+                    slice_values.append(None)
+                    continue
+                parsed = int(value)
+                if parsed < 0:
+                    raise ValueError(f"Negative values are not supported: {part}")
+                slice_values.append(parsed)
+            while len(slice_values) < 3:
+                slice_values.append(None)
+
+            start, stop, step = slice_values
+
+            if start == 0 or stop == 0:
+                raise ValueError(f"Selector values must be 1-based: {part}")
+            if step is not None and step <= 0:
+                raise ValueError(f"Slice step must be greater than zero: {part}")
+
+            py_start = None if start is None else (start - 1)
+            py_stop = None if stop is None else stop
+            for idx in range(*slice(py_start, py_stop, step).indices(length)):
+                append_index(idx)
+            continue
+
+        idx = int(part)
+        if idx <= 0:
+            raise ValueError(f"Selector values must be 1-based: {part}")
+        idx -= 1
+        if idx >= length:
+            raise IndexError(f"Index out of range: {part}")
+        append_index(idx)
+
+    return selected
+
 def split_audio(file_path, segments, output_folder, format, album):
     """
     Splits the audio file into segments based on timestamps.
@@ -533,27 +621,27 @@ def split_audio(file_path, segments, output_folder, format, album):
         output_folder (str): Folder to save the split audio files.
     """
     lock = threading.Lock()
-    def split_segment(i, start_time, name, audio):
+    def split_segment(i, source_index, start_time, end_time, name, audio):
         global g_audio_split_worker
         nonlocal lock, format, album, output_folder
         title = Title(name)
         title.fix_title(album, False)
         title_str = str(title)
-        track_number = title.track_index + 1 if title.track_index != -1 else i + 1
+        track_number = title.track_index + 1 if title.track_index != -1 else source_index + 1
         try:
             params = audio.getparams()
             frame_rate = params.framerate
 
             # Determine the start and end frames
             start_frame = int(start_time * frame_rate)
-            end_frame = int(segments[i + 1][0] * frame_rate) if i + 1 < len(segments) else params.nframes
+            end_frame = int(end_time * frame_rate) if end_time is not None else params.nframes
 
             # Set the position and read frames
             with lock:
                 audio.setpos(start_frame)
                 frames = audio.readframes(end_frame - start_frame)
 
-            if not g_audio_split_worker.start_task(title_str, i):
+            if not g_audio_split_worker.start_task(title_str, source_index):
                 g_audio_split_worker.abort_task()
                 add_download_result(RESULT_SKIPPED, title_str, "Segment was skipped", track_number)
                 return
@@ -583,8 +671,8 @@ def split_audio(file_path, segments, output_folder, format, album):
         threads = []
         global g_audio_split_worker
         g_audio_split_worker = Worker(4, len(segments))
-        for i, (start_time, name) in enumerate(segments):
-            thread = threading.Thread(target=split_segment, args=(i, start_time, name, audio))
+        for i, (source_index, start_time, end_time, name) in enumerate(segments):
+            thread = threading.Thread(target=split_segment, args=(i, source_index, start_time, end_time, name, audio))
             threads.append(thread)
             thread.start()
 
@@ -1114,7 +1202,7 @@ def search_wikipedia_with_search_api(album_name, artist_name):
     except Exception:
         return None
 
-def download_youtube_video(url, output_folder, format, album, i = 0, limit = None, ignore_segments = False, title_hint = None):
+def download_youtube_video(url, output_folder, format, album, i = 0, limit = None, ignore_segments = False, title_hint = None, segment_selector = None, retry_attempt = 1):
     """
     Downloads a YouTube video, converts it to WAV, splits it into segments, and saves it in the specified folder.
 
@@ -1125,6 +1213,31 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
     global g_download_worker
     title_str = None
     track_number = i + 1 if i is not None and i >= 0 else None
+
+    def retry_or_finalize_error(message, error_obj = None):
+        nonlocal title_str, track_number
+        if title_str:
+            g_download_worker.cancel_task(title_str)
+
+        if retry_attempt < 3:
+            time.sleep(1)
+            return download_youtube_video(
+                url,
+                output_folder,
+                format,
+                album,
+                i,
+                limit,
+                ignore_segments,
+                title_hint,
+                segment_selector,
+                retry_attempt + 1,
+            )
+
+        final_message = str(error_obj) if error_obj is not None else message
+        add_download_result(RESULT_ERROR, title_str if title_str else url, final_message, track_number)
+        return None
+
     try:
         if title_hint:
             hinted_title = Title(title_hint)
@@ -1154,11 +1267,27 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
         if ignore_segments: # do not parse segments when in a playlist
             segments = []
         else:
-            segments = parse_timestamps(description)
+            raw_segments = parse_timestamps(description)
+            selector_expr = segment_selector
+            if selector_expr is None and limit is not None:
+                selector_expr = f"[:{limit}]"
 
-        # Limit the number of segments if specified
-        if limit:
-            segments = segments[:limit]
+            if selector_expr is None:
+                selected_indices = list(range(len(raw_segments)))
+            else:
+                try:
+                    selected_indices = parse_index_selector(selector_expr, len(raw_segments))
+                except Exception as e:
+                    print(f"{COLOR_ERROR}Invalid segment selector {selector_expr}: {e}{COLOR_RESET}")
+                    g_download_worker.cancel_task(title_str)
+                    add_download_result(RESULT_ERROR, url, f"Invalid selector {selector_expr}", track_number)
+                    return None
+
+            segments = []
+            for segment_index in selected_indices:
+                start_time, segment_name = raw_segments[segment_index]
+                end_time = raw_segments[segment_index + 1][0] if segment_index + 1 < len(raw_segments) else None
+                segments.append((segment_index, start_time, end_time, segment_name))
 
         # Get video title and description
         title = yt.title
@@ -1193,18 +1322,12 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
         # Get the audio stream
         audio_stream = yt.streams.filter(only_audio=True).first()
         if not audio_stream:
-            print(f"{COLOR_ERROR}No audio stream available for video: {yt.title}{COLOR_RESET}")
-            g_download_worker.cancel_task(title_str)
-            add_download_result(RESULT_ERROR, title_str, "No audio stream available", track_number)
-            return
+            return retry_or_finalize_error("No audio stream available")
 
         # Download the audio to the output folder
         downloaded_file = audio_stream.download(output_path=output_folder)
         if not downloaded_file or not os.path.exists(downloaded_file):
-            print(f"{COLOR_ERROR}Failed to download audio for video: {yt.title}{COLOR_RESET}")
-            g_download_worker.cancel_task(title_str)
-            add_download_result(RESULT_ERROR, title_str, "Audio download failed", track_number)
-            return None
+            return retry_or_finalize_error("Audio download failed")
 
         g_download_worker.increment(title_str)
 
@@ -1259,12 +1382,9 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
 
         return output_folder
     except Exception as e:
-        print(f"{COLOR_ERROR}An error occurred while processing video: {url}. Error: {e}{COLOR_RESET}")
-        g_download_worker.cancel_task(title_str)
-        add_download_result(RESULT_ERROR, title_str if title_str else url, str(e), track_number)
-        return None
+        return retry_or_finalize_error("Video processing failed", e)
 
-def download_youtube_playlist(playlist_url, output_folder, format, album, song_limit = None):
+def download_youtube_playlist(playlist_url, output_folder, format, album, song_limit = None, track_selector = None):
     """
     Downloads all videos in a YouTube playlist.
 
@@ -1297,27 +1417,40 @@ def download_youtube_playlist(playlist_url, output_folder, format, album, song_l
             normalized_urls.append(normalized_url)
         urls = normalized_urls
 
-        if song_limit:
-            urls = urls[:song_limit]
-
         if not urls:
             print(f"{COLOR_ERROR}No videos found in playlist: {playlist_url}{COLOR_RESET}")
             return None
+
+        selector_expr = track_selector
+        if selector_expr is None and song_limit is not None:
+            selector_expr = f"[:{song_limit}]"
+
+        try:
+            selected_indices = parse_index_selector(selector_expr, len(urls))
+        except Exception as e:
+            print(f"{COLOR_ERROR}Invalid playlist selector {selector_expr}: {e}{COLOR_RESET}")
+            return None
+
+        if not selected_indices:
+            print(f"{COLOR_ERROR}No playlist items selected.{COLOR_RESET}")
+            return None
+
+        selected_urls = [(original_index, urls[original_index]) for original_index in selected_indices]
 
         # Create the output folder if it doesn't exist
         os.makedirs(output_folder, exist_ok=True)
 
         # Iterate through all videos in the playlist
         global g_download_worker
-        g_download_worker = Worker(4, len(urls))
+        g_download_worker = Worker(4, len(selected_urls))
         threads = []
-        results = [None] * len(urls)
+        results = [None] * len(selected_urls)
 
-        def download_video_at_index(index, video_url, track_hint):
-            results[index] = download_youtube_video(video_url, output_folder, format, album, index, None, True, track_hint)
+        def download_video_at_index(result_index, original_index, video_url, track_hint):
+            results[result_index] = download_youtube_video(video_url, output_folder, format, album, original_index, None, True, track_hint)
 
-        for i, video_url in enumerate(urls):
-            track_hint = album.tracks[i] if album and i < len(album.tracks) else None
+        for result_index, (original_index, video_url) in enumerate(selected_urls):
+            track_hint = album.tracks[original_index] if album and original_index < len(album.tracks) else None
 
             # Pre-check with known track names to skip files before making any network request.
             if track_hint:
@@ -1325,14 +1458,14 @@ def download_youtube_playlist(playlist_url, output_folder, format, album, song_l
                 hinted_path = os.path.join(output_folder, f'{hinted_title.file_name}.{format}')
                 if os.path.exists(hinted_path):
                     g_download_worker.abort_task()
-                    add_download_result(RESULT_SKIPPED, hinted_title.display_name, "File already exists", i + 1)
+                    add_download_result(RESULT_SKIPPED, hinted_title.display_name, "File already exists", original_index + 1)
                     continue
 
-            thread = threading.Thread(target=download_video_at_index, args=(i, video_url, track_hint))
+            thread = threading.Thread(target=download_video_at_index, args=(result_index, original_index, video_url, track_hint))
             threads.append(thread)
             thread.start()
             # Avoid bursting requests too quickly, which can trigger bot detection.
-            if i < len(urls) - 1 and YOUTUBE_REQUEST_SPACING_SECONDS > 0:
+            if result_index < len(selected_urls) - 1 and YOUTUBE_REQUEST_SPACING_SECONDS > 0:
                 time.sleep(YOUTUBE_REQUEST_SPACING_SECONDS)
         
         # Wait for all threads to complete
@@ -1710,17 +1843,30 @@ def main():
                 url_requests = []
                 invalid_input = False
                 for chunk in [part.strip() for part in entry.split(";") if part.strip()]:
+                    selector_expr = None
+                    selector_match = re.search(r"\[[^\]]*\]\s*$", chunk)
+                    if selector_match:
+                        selector_expr = selector_match.group(0).strip()
+                        chunk = chunk[:selector_match.start()].strip()
+
                     chunk_parts = chunk.split()
+                    if not chunk_parts:
+                        print(f"{COLOR_ERROR}Invalid YouTube URL entry.{COLOR_RESET}")
+                        invalid_input = True
+                        break
+
                     url_candidate = chunk_parts[0]
                     if get_playlist_url(url_candidate) is None and "youtu" not in url_candidate.lower():
                         print(f"{COLOR_ERROR}Invalid YouTube URL: {url_candidate}{COLOR_RESET}")
                         invalid_input = True
                         break
 
-                    chunk_limit = None
+                    # Legacy shorthand: "url 3" means first 3 entries/segments.
                     if len(chunk_parts) > 1:
                         try:
-                            chunk_limit = int(chunk_parts[1])
+                            legacy_limit = int(chunk_parts[1])
+                            if selector_expr is None:
+                                selector_expr = f"[:{legacy_limit}]"
                         except ValueError:
                             print(f"{COLOR_ERROR}Invalid limit value: {chunk_parts[1]}{COLOR_RESET}")
                             invalid_input = True
@@ -1730,7 +1876,7 @@ def main():
                         invalid_input = True
                         break
 
-                    url_requests.append((url_candidate, chunk_limit))
+                    url_requests.append((url_candidate, selector_expr))
 
                 if invalid_input:
                     continue
@@ -1930,12 +2076,12 @@ def main():
         album.artwork = album_artwork
 
         album_path = os.path.join(output_folder, album.get_folder_name())
-        for request_index, (request_url, request_limit) in enumerate(url_requests):
+        for request_index, (request_url, request_selector) in enumerate(url_requests):
             playlist_url = get_playlist_url(request_url)
             if playlist_url is not None:
                 # Process as a playlist
                 print(f"{COLOR_INFO}Processing playlist...{COLOR_RESET}")
-                output_folder = download_youtube_playlist(playlist_url, album_path, format, album, request_limit)
+                output_folder = download_youtube_playlist(playlist_url, album_path, format, album, track_selector=request_selector)
             elif "youtu" in request_url:
                 # Process as a single video
                 print(f"{COLOR_INFO}Processing video...{COLOR_RESET}")
@@ -1946,7 +2092,7 @@ def main():
                     single_track_hint = album.tracks[request_index]
                 elif album and len(album.tracks) == 1:
                     single_track_hint = album.tracks[0]
-                output_folder = download_youtube_video(request_url, album_path, format, album, i=request_index, limit=request_limit, title_hint=single_track_hint)
+                output_folder = download_youtube_video(request_url, album_path, format, album, i=request_index, title_hint=single_track_hint, segment_selector=request_selector)
                 # Get the output folder from the returned file path
                 if output_folder is not None and os.path.isfile(output_folder):
                     output_folder = os.path.dirname(output_folder)
