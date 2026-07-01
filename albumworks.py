@@ -78,28 +78,58 @@ class DownloadResultDisplay:
             # If succeeded, it has been written to a file
             # If skipped, the file already exists
             # If failed, we will want to know why
-            if status == RESULT_ERROR:
-                suffix = f" -> {detail}" if detail else ""
+            if status == RESULT_SUCCESS:
+                suffix = ""
             else:
-                suffix = ''  # No suffix for success or skipped
+                suffix = f" -> {detail}" if detail else ""
             track_prefix = f"{track_number}. " if track_number is not None else ""
             print(f"{color}[{status}] {track_prefix}{item}{suffix}{COLOR_RESET}")
 
-    def print_summary(self):
-        with self.lock:
-            if not self.results:
-                return
-            success = sum(1 for status, _, _, _ in self.results if status == RESULT_SUCCESS)
-            skipped = sum(1 for status, _, _, _ in self.results if status == RESULT_SKIPPED)
-            errors = sum(1 for status, _, _, _ in self.results if status == RESULT_ERROR)
-        if skipped + errors > 0:
-            print(f"Results: {success} success, {skipped} skipped, {errors} errors.")
-
 g_result_display = DownloadResultDisplay()
+g_track_prompt_lock = threading.Lock()
+g_pending_track_assignments = []
+g_pending_track_assignments_lock = threading.Lock()
 
 def add_download_result(status, item, detail = None, track_number = None):
     global g_result_display
     g_result_display.add(status, item, detail, track_number)
+
+def prompt_for_track_number(title_text, album):
+    with g_track_prompt_lock:
+        while True:
+            response = input(f'Enter the track number for "{title_text}" (blank to discard; higher numbers append to the end): ').strip()
+            if len(response) == 0:
+                return None
+            try:
+                requested_track_number = int(response)
+            except ValueError:
+                print(f"{COLOR_ERROR}Invalid track number.{COLOR_RESET}")
+                continue
+            if requested_track_number <= 0:
+                print(f"{COLOR_ERROR}Track number must be greater than zero.{COLOR_RESET}")
+                continue
+            return requested_track_number
+
+def reserve_album_track(album, track_index):
+    if album is None or track_index < 0:
+        return
+    with album.lock:
+        if track_index < len(album.used):
+            album.used[track_index] = True
+
+def clear_pending_track_assignments():
+    with g_pending_track_assignments_lock:
+        g_pending_track_assignments.clear()
+
+def add_pending_track_assignment(item):
+    with g_pending_track_assignments_lock:
+        g_pending_track_assignments.append(item)
+
+def pop_pending_track_assignments():
+    with g_pending_track_assignments_lock:
+        pending = list(g_pending_track_assignments)
+        g_pending_track_assignments.clear()
+    return pending
 
 class WorkerTask:
     def __init__(self, priority):
@@ -113,18 +143,22 @@ class WorkerTask:
         self.progress = progress
 
 class Worker:
-    def __init__(self, task_weight, task_count, width=50):
+    def __init__(self, task_weight, task_count, width=50, show_progress=True):
         self.total = task_count * task_weight
         self.task_count = task_count
         self.task_weight = task_weight
         self.lock = threading.Lock()
         self.tasks: dict[str, WorkerTask] = dict()
         self.width = width
+        self._printed_complete = False
+        self.show_progress = show_progress
 
         self.display()
 
     def _check_priority(self, old, new):
-        return old < new
+        # Allow equal priority so retrying the same task does not get rejected
+        # as a duplicate in threaded download flows.
+        return old <= new
     
     def abort_task(self):
         if self.task_count <= 0:
@@ -179,13 +213,19 @@ class Worker:
             return sum(task.progress for task in self.tasks.values())
 
     def display(self):
+        if not self.show_progress:
+            return
         total = self.get_total()
         current = self.get_current()
         if current > total:
             current = total
         if current == total:
+            if self._printed_complete:
+                return
+            self._printed_complete = True
             print(f"\rProgress: [{'#' * self.width}] 100%")
             return
+        self._printed_complete = False
         percent = (current / total * 100) if total else 0
         bar_length = int(self.width * percent / 100)
         bar = "#" * bar_length + "-" * (self.width - bar_length)
@@ -214,9 +254,18 @@ def increment_or_add_suffix(string):
         return string + " 2"
 
 def fix_for_path(path):
-    # Remove illegal characters for file and folder names
-    path = re.sub(r'[<>:"/\\|?*]', '', path)
+    # Remove illegal or troublesome characters for file and folder names.
+    path = re.sub(r'[<>:"/\\|?*.]', '', path)
     return path.strip()
+
+def normalize_track_match_text(text):
+    if not text:
+        return ""
+    text = re.sub(r"[\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uFE58\uFE63\uFF0D]", "-", text)
+    text = re.sub(r"\s*[-|]\s*", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[^a-zA-Z0-9\s]", "", text)
+    return text.strip().lower()
 
 class Title:
     display_name: str
@@ -259,7 +308,7 @@ class Title:
         title = re.sub(r'\|.*$', '', title, flags=re.IGNORECASE)
 
         # If there is a quote block, return that
-        quote_pattern = r'[\'"](.+?)[\'"]'
+        quote_pattern = r'(?<!\w)[\'\"“”]([^\'\"“”]+)[\'\"“”](?!\w)'
         quote_match = re.search(quote_pattern, title)
         if quote_match:
             title = quote_match.group(1)
@@ -267,8 +316,9 @@ class Title:
         # Remove any numbers at the start of the title
         title = re.sub(r'^\d+[).]?\s*', '', title, flags=re.IGNORECASE)
 
-        # Remove " - "or " | ", etc.
-        title = re.sub(r' ?[-|] ?', '', title)
+        # Normalize separators to spaces so words do not get concatenated.
+        title = re.sub(r'\s*[-|]\s*', ' ', title)
+        title = re.sub(r'\s+', ' ', title)
 
         # Remove leading or trailing whitespace and punctuation
         title = re.sub(r'^[^a-zA-Z0-9\(]+|[^a-zA-Z0-9\)]+$', '', title)
@@ -322,7 +372,23 @@ def find_closest_string_index(target: str, string_list, used: list[bool]) -> int
     Returns:
         int: The index of the closest matching string, or -1 if no match is found.
     """
+    def normalize_track_text(text: str) -> str:
+        if not text:
+            return ""
+        # Normalize common Unicode dash/hyphen variants to a plain hyphen.
+        text = re.sub(r"[\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uFE58\uFE63\uFF0D]", "-", text)
+        # Normalize spacing around hyphens and collapse duplicate whitespace.
+        text = re.sub(r"\s*-\s*", " - ", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip().lower()
+
     def _find_closest_string_index(target: str, string_list, used: list[bool]) -> int:
+        # Prefer exact matches first after normalization.
+        for i, string in enumerate(string_list):
+            if len(string) == 0:
+                continue
+            if string == target and not used[i]:
+                return i
         # try matching the first string that starts with the target
         for i, string in enumerate(string_list):
             if len(string) == 0:
@@ -347,8 +413,8 @@ def find_closest_string_index(target: str, string_list, used: list[bool]) -> int
         return -1
     
     # replace fancy quotes with normal quotes
-    target = re.sub(r'[‘’]', '\'', re.sub(r'[“”]', '"', target)).lower()
-    string_list = [re.sub(r'[‘’]', '\'', re.sub(r'[“”]', '"', s)).lower() for s in string_list]  # Normalize case for comparison
+    target = normalize_track_text(re.sub(r'[‘’]', '\'', re.sub(r'[“”]', '"', target)))
+    string_list = [normalize_track_text(re.sub(r'[‘’]', '\'', re.sub(r'[“”]', '"', s))) for s in string_list]
 
     def strip_quotes(text: str) -> str:
         return re.sub(r'[\'"“”‘’]', '', text)
@@ -366,8 +432,8 @@ def find_closest_string_index(target: str, string_list, used: list[bool]) -> int
         return index
     
     # try again but remove all (...) and [...]
-    target_cleaned = re.sub(r'(\[.*?\]|\(.*?\))', '', target).strip()
-    string_list_cleaned = [re.sub(r'(\[.*?\]|\(.*?\))', '', s).strip() for s in string_list]
+    target_cleaned = normalize_track_text(re.sub(r'(\[.*?\]|\(.*?\))', '', target))
+    string_list_cleaned = [normalize_track_text(re.sub(r'(\[.*?\]|\(.*?\))', '', s)) for s in string_list]
     target_cleaned_no_quotes = strip_quotes(target_cleaned)
     string_list_cleaned_no_quotes = [strip_quotes(s) for s in string_list_cleaned]
     index = _find_closest_string_index(target_cleaned_no_quotes, string_list_cleaned_no_quotes, used)
@@ -1218,7 +1284,7 @@ def search_wikipedia_with_search_api(album_name, artist_name):
     except Exception:
         return None
 
-def download_youtube_video(url, output_folder, format, album, i = 0, limit = None, ignore_segments = False, title_hint = None, segment_selector = None, retry_attempt = 1):
+def download_youtube_video(url, output_folder, format, album, i = 0, limit = None, ignore_segments = False, title_hint = None, segment_selector = None, retry_attempt = 1, worker = None, forced_track_index = None):
     """
     Downloads a YouTube video, converts it to WAV, splits it into segments, and saves it in the specified folder.
 
@@ -1226,14 +1292,15 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
         url (str): The URL of the YouTube video.
         output_folder (str): The folder where the video and its segments will be saved.
     """
-    global g_download_worker
+    download_worker = worker if worker is not None else Worker(4, 1)
     title_str = None
+    worker_task_id = None
     track_number = i + 1 if i is not None and i >= 0 else None
 
     def retry_or_finalize_error(message, error_obj = None):
-        nonlocal title_str, track_number
+        nonlocal title_str, worker_task_id, track_number
         if title_str:
-            g_download_worker.cancel_task(title_str)
+            download_worker.cancel_task(worker_task_id if worker_task_id else title_str)
 
         if retry_attempt < 3:
             time.sleep(1)
@@ -1248,6 +1315,8 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
                 title_hint,
                 segment_selector,
                 retry_attempt + 1,
+                worker,
+                forced_track_index,
             )
 
         final_message = str(error_obj) if error_obj is not None else message
@@ -1264,7 +1333,7 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
                         track_number = idx + 1
                         break
             if os.path.exists(hinted_path):
-                g_download_worker.abort_task()
+                download_worker.abort_task()
                 add_download_result(RESULT_SKIPPED, hinted_title.display_name, "File already exists", track_number)
                 return None
 
@@ -1272,7 +1341,7 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
         if not normalized_url:
             print(f"{COLOR_ERROR}Skipping invalid video URL: {url}{COLOR_RESET}")
             add_download_result(RESULT_SKIPPED, url, "Invalid video URL", track_number)
-            g_download_worker.abort_task()
+            download_worker.abort_task()
             return None
 
         # Create a YouTube object
@@ -1295,7 +1364,7 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
                     selected_indices = parse_index_selector(selector_expr, len(raw_segments))
                 except Exception as e:
                     print(f"{COLOR_ERROR}Invalid segment selector {selector_expr}: {e}{COLOR_RESET}")
-                    g_download_worker.cancel_task(title_str)
+                    download_worker.cancel_task(title_str)
                     add_download_result(RESULT_ERROR, url, f"Invalid selector {selector_expr}", track_number)
                     return None
 
@@ -1312,28 +1381,93 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
         title = Title(yt.title)
         if not segments: # this video is the song
             # If this is the only video being downloaded AND there is only one song in the album, use the album track list to fix the title
-            if g_download_worker.task_count == 1 and album and len(album.tracks) == 1:
+            if download_worker.task_count == 1 and album and len(album.tracks) == 1:
                 title.set_title(album.tracks[0], 0)
             else:
-                title.fix_title(album, False)
+                title.fix_title(album, True)
         else: # this video has segments (each segment is a song)
             title.fix_title(None, True)
         title_str = str(title)
-        if title.track_index != -1:
+        if forced_track_index is not None and album and not segments:
+            if forced_track_index < len(album.tracks):
+                title.set_title(album.tracks[forced_track_index], forced_track_index)
+            else:
+                title.set_title(title_str, forced_track_index)
+            title_str = str(title)
             track_number = title.track_index + 1
+            reserve_album_track(album, title.track_index)
+        elif title.track_index != -1:
+            track_number = title.track_index + 1
+            reserve_album_track(album, title.track_index)
+        elif album and not segments:
+            assigned_from_hint = False
+            if title_hint:
+                normalized_guess = normalize_track_match_text(title_str)
+                normalized_hint = normalize_track_match_text(title_hint)
+                similarity = difflib.SequenceMatcher(None, normalized_guess, normalized_hint).ratio()
+                hint_matches_guess = (
+                    normalized_guess == normalized_hint
+                    or (len(normalized_guess) > 0 and normalized_guess in normalized_hint)
+                    or (len(normalized_hint) > 0 and normalized_hint in normalized_guess)
+                    or similarity >= 0.85
+                )
 
-        if not g_download_worker.start_task(title_str, i):
-            g_download_worker.abort_task()
-            add_download_result(RESULT_SKIPPED, title_str, "Skipped by priority", track_number)
+                if hint_matches_guess:
+                    hinted_index = -1
+                    with album.lock:
+                        if i is not None and 0 <= i < len(album.tracks) and normalize_track_match_text(album.tracks[i]) == normalized_hint:
+                            hinted_index = i
+                        else:
+                            for idx, track_name in enumerate(album.tracks):
+                                if normalize_track_match_text(track_name) == normalized_hint:
+                                    hinted_index = idx
+                                    break
+                    if hinted_index != -1:
+                        title.set_title(album.tracks[hinted_index], hinted_index)
+                        title_str = str(title)
+                        track_number = hinted_index + 1
+                        reserve_album_track(album, hinted_index)
+                        assigned_from_hint = True
+
+            # For 1:1 playlist ordering, prefer the request index as a fallback
+            # before prompting the user.
+            if not assigned_from_hint and i is not None and 0 <= i < len(album.tracks):
+                title.set_title(album.tracks[i], i)
+                title_str = str(title)
+                track_number = i + 1
+                reserve_album_track(album, i)
+                assigned_from_hint = True
+
+            if not assigned_from_hint:
+                add_pending_track_assignment({
+                    "url": url,
+                    "output_folder": output_folder,
+                    "format": format,
+                    "album": album,
+                    "request_index": i,
+                    "limit": limit,
+                    "ignore_segments": ignore_segments,
+                    "title_hint": title_hint,
+                    "segment_selector": segment_selector,
+                    "title_guess": title_str,
+                })
+                download_worker.abort_task()
+                return None
+
+        worker_task_id = f"{i}:{title_str}" if i is not None else title_str
+
+        if not download_worker.start_task(worker_task_id, i if i is not None else 0):
+            download_worker.abort_task()
+            add_download_result(RESULT_SKIPPED, title_str, "Duplicate", track_number)
             return
         
         # If song is already downloaded, skip
         if os.path.exists(os.path.join(output_folder, f'{title.file_name}.{format}')):
-            g_download_worker.cancel_task(title_str)
+            download_worker.cancel_task(worker_task_id)
             add_download_result(RESULT_SKIPPED, title_str, "File already exists", track_number)
             return
 
-        g_download_worker.increment(title_str)
+        download_worker.increment(worker_task_id)
 
         # Get the audio stream
         audio_stream = yt.streams.filter(only_audio=True).first()
@@ -1345,11 +1479,14 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
         if not downloaded_file or not os.path.exists(downloaded_file):
             return retry_or_finalize_error("Audio download failed")
 
-        g_download_worker.increment(title_str)
+        download_worker.increment(worker_task_id)
 
         # Rename to use the safe title
         file_name = TEMP_NAME if segments else title.file_name
-        file_name = os.path.join(output_folder, f"{file_name}.mp4")
+        downloaded_extension = os.path.splitext(downloaded_file)[1]
+        if not downloaded_extension:
+            downloaded_extension = ".mp4"
+        file_name = os.path.join(output_folder, f"{file_name}{downloaded_extension}")
 
         # Normalize temporary name so conversion always targets a known path.
         if os.path.abspath(downloaded_file) != os.path.abspath(file_name):
@@ -1358,18 +1495,18 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
             os.replace(downloaded_file, file_name)
         downloaded_file = file_name
 
-        g_download_worker.increment(title_str)
+        download_worker.increment(worker_task_id)
         
         # if no segments are found, convert to target format and return (this is a single song video)
         if not segments:
             final_file = convert_file(downloaded_file, format)
             if not final_file:
                 print(f"{COLOR_ERROR}Failed to convert audio for video: {yt.title}{COLOR_RESET}")
-                g_download_worker.cancel_task(title_str)
+                download_worker.cancel_task(worker_task_id)
                 add_download_result(RESULT_ERROR, title_str, "Audio conversion failed", track_number)
                 return None
             update_metadata(final_file, album, title)
-            g_download_worker.increment(title_str)
+            download_worker.increment(worker_task_id)
             add_download_result(RESULT_SUCCESS, title_str, final_file, track_number)
             return final_file
 
@@ -1379,11 +1516,11 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
         wav_file = convert_file(downloaded_file, "wav", trim_silence=False)
         if not wav_file:
             print(f"{COLOR_ERROR}Failed to prepare audio segments for video: {yt.title}{COLOR_RESET}")
-            g_download_worker.cancel_task(title_str)
+            download_worker.cancel_task(worker_task_id)
             add_download_result(RESULT_ERROR, title_str, "Failed to prepare split segments", track_number)
             return None
 
-        g_download_worker.increment(title_str)
+        download_worker.increment(worker_task_id)
 
         # Create a folder for the video's segments
         os.makedirs(output_folder, exist_ok=True)
@@ -1400,7 +1537,7 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
     except Exception as e:
         return retry_or_finalize_error("Video processing failed", e)
 
-def download_youtube_playlist(playlist_url, output_folder, format, album, song_limit = None, track_selector = None):
+def download_youtube_playlist(playlist_url, output_folder, format, album, song_limit = None, track_selector = None, worker = None):
     """
     Downloads all videos in a YouTube playlist.
 
@@ -1457,13 +1594,12 @@ def download_youtube_playlist(playlist_url, output_folder, format, album, song_l
         os.makedirs(output_folder, exist_ok=True)
 
         # Iterate through all videos in the playlist
-        global g_download_worker
-        g_download_worker = Worker(4, len(selected_urls))
+        download_worker = worker if worker is not None else Worker(4, len(selected_urls))
         threads = []
         results = [None] * len(selected_urls)
 
         def download_video_at_index(result_index, original_index, video_url, track_hint):
-            results[result_index] = download_youtube_video(video_url, output_folder, format, album, original_index, None, True, track_hint)
+            results[result_index] = download_youtube_video(video_url, output_folder, format, album, original_index, None, True, track_hint, worker=download_worker)
 
         for result_index, (original_index, video_url) in enumerate(selected_urls):
             track_hint = album.tracks[original_index] if album and original_index < len(album.tracks) else None
@@ -1473,7 +1609,7 @@ def download_youtube_playlist(playlist_url, output_folder, format, album, song_l
                 hinted_title = Title(track_hint)
                 hinted_path = os.path.join(output_folder, f'{hinted_title.file_name}.{format}')
                 if os.path.exists(hinted_path):
-                    g_download_worker.abort_task()
+                    download_worker.abort_task()
                     add_download_result(RESULT_SKIPPED, hinted_title.display_name, "File already exists", original_index + 1)
                     continue
 
@@ -1492,6 +1628,104 @@ def download_youtube_playlist(playlist_url, output_folder, format, album, song_l
     except Exception as e:
         print(f"{COLOR_ERROR}An error occurred while processing the playlist: {playlist_url}. Error: {e}{COLOR_RESET}")
         return None
+
+def process_url_request(request_index, request_url, request_selector, album_path, album, format):
+    playlist_url = get_playlist_url(request_url)
+    if playlist_url is not None:
+        return download_youtube_playlist(playlist_url, album_path, format, album, track_selector=request_selector)
+
+    if "youtu" in request_url:
+        single_worker = Worker(4, 1)
+        single_track_hint = None
+        if album and request_index < len(album.tracks):
+            single_track_hint = album.tracks[request_index]
+        elif album and len(album.tracks) == 1:
+            single_track_hint = album.tracks[0]
+
+        output_file = download_youtube_video(
+            request_url,
+            album_path,
+            format,
+            album,
+            i=request_index,
+            title_hint=single_track_hint,
+            segment_selector=request_selector,
+            worker=single_worker,
+        )
+        if output_file is not None and os.path.isfile(output_file):
+            return os.path.dirname(output_file)
+        return output_file
+
+    print(f"{COLOR_ERROR}Invalid URL. Please provide a valid YouTube video or playlist URL.{COLOR_RESET}")
+    return None
+
+def process_url_requests(url_requests, album_path, album, format):
+    if len(url_requests) == 0:
+        return None
+    if len(url_requests) == 1:
+        request_url, request_selector = url_requests[0]
+        return process_url_request(0, request_url, request_selector, album_path, album, format)
+
+    threads = []
+    results = [None] * len(url_requests)
+
+    def run_request(request_index, request_url, request_selector):
+        results[request_index] = process_url_request(request_index, request_url, request_selector, album_path, album, format)
+
+    for request_index, (request_url, request_selector) in enumerate(url_requests):
+        thread = threading.Thread(target=run_request, args=(request_index, request_url, request_selector))
+        threads.append(thread)
+        thread.start()
+        if request_index < len(url_requests) - 1 and YOUTUBE_REQUEST_SPACING_SECONDS > 0:
+            time.sleep(YOUTUBE_REQUEST_SPACING_SECONDS)
+
+    for thread in threads:
+        thread.join()
+
+    for result in results:
+        if result is not None:
+            return result
+    return None
+
+def process_pending_track_assignments():
+    pending_assignments = pop_pending_track_assignments()
+    if not pending_assignments:
+        return
+
+    print(f"{COLOR_INFO}Resolving deferred track assignments...{COLOR_RESET}")
+
+    for pending in pending_assignments:
+        title_guess = pending["title_guess"]
+        album = pending["album"]
+        requested_track_number = prompt_for_track_number(title_guess, album)
+
+        if requested_track_number is None:
+            add_download_result(RESULT_SKIPPED, title_guess, "Discarded", pending["request_index"] + 1)
+            continue
+
+        if requested_track_number <= len(album.tracks):
+            chosen_track_index = requested_track_number - 1
+        else:
+            with album.lock:
+                chosen_track_index = len(album.tracks)
+                album.tracks.append(title_guess)
+                album.lowered_tracks.append(title_guess.lower())
+                album.used.append(True)
+
+        worker = Worker(4, 1, show_progress=False)
+        download_youtube_video(
+            pending["url"],
+            pending["output_folder"],
+            pending["format"],
+            album,
+            i=chosen_track_index,
+            limit=pending["limit"],
+            ignore_segments=pending["ignore_segments"],
+            title_hint=pending["title_hint"],
+            segment_selector=pending["segment_selector"],
+            worker=worker,
+            forced_track_index=chosen_track_index,
+        )
 
 def download_youtube_thumbnail(url, output_folder, name):
     """
@@ -2044,6 +2278,7 @@ def main():
         print()
 
         g_result_display.reset()
+        clear_pending_track_assignments()
 
         # Search for the album artwork
         print(f"{COLOR_INFO}Searching for album artwork...{COLOR_RESET}")
@@ -2093,32 +2328,10 @@ def main():
         album.artwork = album_artwork
 
         album_path = os.path.join(output_folder, album.get_folder_name())
-        for request_index, (request_url, request_selector) in enumerate(url_requests):
-            playlist_url = get_playlist_url(request_url)
-            if playlist_url is not None:
-                # Process as a playlist
-                print(f"{COLOR_INFO}Processing playlist...{COLOR_RESET}")
-                output_folder = download_youtube_playlist(playlist_url, album_path, format, album, track_selector=request_selector)
-            elif "youtu" in request_url:
-                # Process as a single video
-                print(f"{COLOR_INFO}Processing video...{COLOR_RESET}")
-                global g_download_worker
-                g_download_worker = Worker(4, 1)
-                single_track_hint = None
-                if album and request_index < len(album.tracks):
-                    single_track_hint = album.tracks[request_index]
-                elif album and len(album.tracks) == 1:
-                    single_track_hint = album.tracks[0]
-                output_folder = download_youtube_video(request_url, album_path, format, album, i=request_index, title_hint=single_track_hint, segment_selector=request_selector)
-                # Get the output folder from the returned file path
-                if output_folder is not None and os.path.isfile(output_folder):
-                    output_folder = os.path.dirname(output_folder)
-            else:
-                print(f"{COLOR_ERROR}Invalid URL. Please provide a valid YouTube video or playlist URL.{COLOR_RESET}")
-                continue
+        output_folder = process_url_requests(url_requests, album_path, album, format) or album_path
+        process_pending_track_assignments()
 
         g_result_display.print_results()
-        g_result_display.print_summary()
         
         # Delete thumbnail if it was downloaded
         if album_artwork_temporary and os.path.exists(album_artwork):
