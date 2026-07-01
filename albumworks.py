@@ -1295,14 +1295,15 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
     download_worker = worker if worker is not None else Worker(4, 1)
     title_str = None
     worker_task_id = None
+    task_started = False
     track_number = i + 1 if i is not None and i >= 0 else None
 
     def retry_or_finalize_error(message, error_obj = None):
-        nonlocal title_str, worker_task_id, track_number
-        if title_str:
-            download_worker.cancel_task(worker_task_id if worker_task_id else title_str)
-
+        nonlocal title_str, worker_task_id, task_started, track_number
         if retry_attempt < 3:
+            if task_started and (worker_task_id or title_str):
+                download_worker.cancel_task(worker_task_id if worker_task_id else title_str)
+
             time.sleep(1)
             return download_youtube_video(
                 url,
@@ -1318,6 +1319,11 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
                 worker,
                 forced_track_index,
             )
+
+        if task_started and (worker_task_id or title_str):
+            download_worker.cancel_task(worker_task_id if worker_task_id else title_str)
+        else:
+            download_worker.abort_task()
 
         final_message = str(error_obj) if error_obj is not None else message
         add_download_result(RESULT_ERROR, title_str if title_str else url, final_message, track_number)
@@ -1460,6 +1466,7 @@ def download_youtube_video(url, output_folder, format, album, i = 0, limit = Non
             download_worker.abort_task()
             add_download_result(RESULT_SKIPPED, title_str, "Duplicate", track_number)
             return
+        task_started = True
         
         # If song is already downloaded, skip
         if os.path.exists(os.path.join(output_folder, f'{title.file_name}.{format}')):
