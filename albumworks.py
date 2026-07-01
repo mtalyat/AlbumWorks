@@ -349,14 +349,30 @@ def find_closest_string_index(target: str, string_list, used: list[bool]) -> int
     # replace fancy quotes with normal quotes
     target = re.sub(r'[‘’]', '\'', re.sub(r'[“”]', '"', target)).lower()
     string_list = [re.sub(r'[‘’]', '\'', re.sub(r'[“”]', '"', s)).lower() for s in string_list]  # Normalize case for comparison
+
+    def strip_quotes(text: str) -> str:
+        return re.sub(r'[\'"“”‘’]', '', text)
     
     index = _find_closest_string_index(target, string_list, used)
+    if index != -1:
+        return index
+
+    # Try again while ignoring quotation marks entirely so tracks like "99" can
+    # still match a YouTube title of 99.
+    target_no_quotes = strip_quotes(target)
+    string_list_no_quotes = [strip_quotes(s) for s in string_list]
+    index = _find_closest_string_index(target_no_quotes, string_list_no_quotes, used)
     if index != -1:
         return index
     
     # try again but remove all (...) and [...]
     target_cleaned = re.sub(r'(\[.*?\]|\(.*?\))', '', target).strip()
     string_list_cleaned = [re.sub(r'(\[.*?\]|\(.*?\))', '', s).strip() for s in string_list]
+    target_cleaned_no_quotes = strip_quotes(target_cleaned)
+    string_list_cleaned_no_quotes = [strip_quotes(s) for s in string_list_cleaned]
+    index = _find_closest_string_index(target_cleaned_no_quotes, string_list_cleaned_no_quotes, used)
+    if index != -1:
+        return index
     index = _find_closest_string_index(target_cleaned, string_list_cleaned, used)
     if index != -1:
         return index
