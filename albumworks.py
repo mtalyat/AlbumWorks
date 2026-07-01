@@ -1959,6 +1959,7 @@ def main():
         else:
             # Get the artist info from MusicBrainz in the background while user types out the album name
             with concurrent.futures.ThreadPoolExecutor() as executor:
+                print(f"{COLOR_INFO}Retrieving artist information...{COLOR_RESET}")
                 future = executor.submit(get_artist_info, search_artist)
 
                 album_name_input = input("Enter the album name: ").strip()
